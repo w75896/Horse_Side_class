@@ -3,6 +3,7 @@ import numpy as np
 import threading
 import time
 from collections import deque
+import os
 
 # 嘗試導入MediaPipe
 try:
@@ -14,6 +15,11 @@ except ImportError:
 
 class OptimizedFaceTracker:
     def __init__(self):
+        # YOLO 設定
+        self.yolo_model = None
+        self.yolo_available = False
+        self.init_yolo()
+        
         # MediaPipe設定
         if MEDIAPIPE_AVAILABLE:
             self.mp_face_detection = mp.solutions.face_detection
@@ -28,7 +34,7 @@ class OptimizedFaceTracker:
         self.trackers = []
         self.tracker_confidences = []
         self.last_detection_time = time.time()
-        self.detection_interval = 0.1  # 每100ms進行一次完整檢測
+        self.detection_interval = 0
         
         # 預測緩存
         self.face_predictions = []
@@ -41,26 +47,161 @@ class OptimizedFaceTracker:
         # 安全區域（擴大的遮擋範圍）
         self.safety_margin = 1.3  # 擴大30%
         
-    def create_tracker(self):
-        """創建追蹤器"""
+        # 檢測方法優先級
+        self.detection_method = 'yolo'  # 'yolo', 'mediapipe', 'haar'
+        
+    def init_yolo(self):
+        """初始化 YOLO 模型"""
         try:
-            # 嘗試使用不同的追蹤器（按性能排序）
-            tracker_types = ['CSRT', 'KCF', 'MOSSE']
+            model_path = 'yolov11n-face.onnx'
+            if os.path.exists(model_path):
+                self.yolo_model = cv2.dnn.readNetFromONNX(model_path)
+                self.yolo_available = True
+                print("✓ YOLOv11n-face 模型載入成功")
+                
+                # 設定運算後端
+                if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                    self.yolo_model.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                    self.yolo_model.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                    print("✓ 使用 CUDA 加速")
+                else:
+                    self.yolo_model.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                    self.yolo_model.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                    print("✓ 使用 CPU 運算")
+            else:
+                print(f"⚠️ 找不到 YOLO 模型檔案: {model_path}")
+                print("  請確保 yolov11n-face.onnx 在程式同目錄下")
+        except Exception as e:
+            print(f"⚠️ YOLO 模型載入失敗: {e}")
+            self.yolo_available = False
+    
+    def detect_faces_yolo(self, frame):
+        """使用 YOLO 檢測人臉"""
+        if not self.yolo_available:
+            return []
+        
+        try:
+            height, width = frame.shape[:2]
             
-            for tracker_type in tracker_types:
+            # 預處理圖像
+            blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), 
+                                       swapRB=True, crop=False)
+            
+            # 推理
+            self.yolo_model.setInput(blob)
+            outputs = self.yolo_model.forward()
+            
+            # 處理輸出
+            faces = []
+            confidences = []
+            
+            # 打印輸出形狀以便調試
+            # print(f"YOLO output shape: {outputs.shape}")
+            
+            # YOLOv11 輸出格式處理
+            # 通常格式是 [1, num_detections, 85] 或 [num_detections, 85]
+            if len(outputs.shape) == 3:
+                outputs = outputs[0]
+            
+            # 轉置如果需要（某些版本輸出是 [85, num_detections]）
+            if outputs.shape[0] in [5, 6, 85] and outputs.shape[1] > outputs.shape[0]:
+                outputs = outputs.T
+            
+            # 解析檢測結果
+            for detection in outputs:
+                if len(detection) >= 5:
+                    # YOLOv11 格式通常是 [x_center, y_center, width, height, confidence, ...]
+                    confidence = float(detection[4])
+                    if confidence > 0.3:  # 降低信心度閾值
+                        # 獲取邊界框座標（相對於640x640）
+                        x_center = detection[0]
+                        y_center = detection[1]
+                        box_width = detection[2]
+                        box_height = detection[3]
+                        
+                        # 轉換回原始圖像座標
+                        scale_x = width / 640.0
+                        scale_y = height / 640.0
+                        
+                        x_center = x_center * scale_x
+                        y_center = y_center * scale_y
+                        w = box_width * scale_x
+                        h = box_height * scale_y
+                        
+                        # 轉換為左上角座標
+                        x = int(x_center - w / 2)
+                        y = int(y_center - h / 2)
+                        w = int(w)
+                        h = int(h)
+                        
+                        # 確保座標在圖像範圍內
+                        x = max(0, x)
+                        y = max(0, y)
+                        w = min(width - x, w)
+                        h = min(height - y, h)
+                        
+                        if w > 15 and h > 15:
+                            faces.append([x, y, w, h])
+                            confidences.append(confidence)
+            
+            # NMS 去除重複檢測
+            if len(faces) > 0:
+                indices = cv2.dnn.NMSBoxes(faces, confidences, 0.3, 0.4)
+                if len(indices) > 0:
+                    if isinstance(indices, np.ndarray):
+                        indices = indices.flatten()
+                    return [tuple(faces[i]) for i in indices]
+            
+            return []
+            
+        except Exception as e:
+            print(f"YOLO 檢測錯誤: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
+    
+    def create_tracker(self):
+        """創建追蹤器 - 針對 OpenCV 4.8.1 優化"""
+        try:
+            # 獲取 OpenCV 版本
+            cv_version = cv2.__version__.split('.')
+            major_version = int(cv_version[0])
+            minor_version = int(cv_version[1])
+            
+            # OpenCV 4.5+ 需要使用 legacy 追蹤器
+            if major_version >= 4 and minor_version >= 5:
+                # 使用 legacy 追蹤器（按性能排序）
+                tracker_creators = [
+                    ('CSRT (legacy)', lambda: cv2.legacy.TrackerCSRT_create()),
+                    ('KCF (legacy)', lambda: cv2.legacy.TrackerKCF_create()),
+                    ('MOSSE (legacy)', lambda: cv2.legacy.TrackerMOSSE_create()),
+                    ('MIL (legacy)', lambda: cv2.legacy.TrackerMIL_create()),
+                    ('MEDIANFLOW (legacy)', lambda: cv2.legacy.TrackerMedianFlow_create()),
+                    ('TLD (legacy)', lambda: cv2.legacy.TrackerTLD_create()),
+                ]
+            else:
+                # 舊版本使用標準追蹤器
+                tracker_creators = [
+                    ('CSRT', lambda: cv2.TrackerCSRT_create()),
+                    ('KCF', lambda: cv2.TrackerKCF_create()),
+                    ('MIL', lambda: cv2.TrackerMIL_create()),
+                ]
+            
+            # 嘗試創建追蹤器
+            for tracker_name, creator_func in tracker_creators:
                 try:
-                    if tracker_type == 'CSRT':
-                        return cv2.TrackerCSRT_create()
-                    elif tracker_type == 'KCF':
-                        return cv2.TrackerKCF_create()
-                    elif tracker_type == 'MOSSE':
-                        return cv2.legacy.TrackerMOSSE_create()
-                except:
+                    tracker = creator_func()
+                    # print(f"成功創建 {tracker_name} 追蹤器")
+                    return tracker
+                except Exception as e:
                     continue
             
-            # 如果都失敗，返回None
+            print("警告：無法創建任何追蹤器")
+            print(f"OpenCV 版本: {cv2.__version__}")
             return None
-        except:
+            
+        except Exception as e:
+            print(f"創建追蹤器時發生錯誤: {e}")
             return None
     
     def predict_face_position(self, face_rect, velocity):
@@ -129,11 +270,17 @@ class OptimizedFaceTracker:
         return (new_x, new_y, new_w, new_h)
     
     def fast_detect_faces(self, frame):
-        """快速人臉檢測"""
+        """快速人臉檢測（支援多種方法）"""
         faces = []
         
+        # 根據優先級使用不同的檢測方法
+        if self.detection_method == 'yolo' and self.yolo_available:
+            faces = self.detect_faces_yolo(frame)
+            if len(faces) > 0:
+                return faces
+        
         # 使用MediaPipe（如果可用）
-        if MEDIAPIPE_AVAILABLE:
+        if MEDIAPIPE_AVAILABLE and (self.detection_method == 'mediapipe' or len(faces) == 0):
             try:
                 rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 results = self.face_detection.process(rgb_frame)
@@ -149,10 +296,13 @@ class OptimizedFaceTracker:
                         
                         if width > 15 and height > 15:
                             faces.append((x, y, width, height))
+                    
+                    if len(faces) > 0:
+                        return faces
             except:
                 pass
         
-        # 如果MediaPipe沒檢測到或不可用，使用快速Haar檢測
+        # 如果還是沒檢測到，使用快速Haar檢測
         if len(faces) == 0:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             # 使用較寬鬆的參數進行快速檢測
@@ -260,18 +410,32 @@ class OptimizedFaceTracker:
                     tracker = self.create_tracker()
                     if tracker:
                         try:
-                            # 稍微擴大初始追蹤區域
-                            track_x = max(0, x - 5)
-                            track_y = max(0, y - 5)
-                            track_w = min(frame.shape[1] - track_x, w + 10)
-                            track_h = min(frame.shape[0] - track_y, h + 10)
+                            # 確保座標是整數
+                            x, y, w, h = int(x), int(y), int(w), int(h)
                             
-                            success = tracker.init(frame, (track_x, track_y, track_w, track_h))
+                            # 確保寬高大於最小值
+                            if w < 20 or h < 20:
+                                continue
+                            
+                            # 不要擴大初始區域，使用原始檢測框
+                            bbox = (x, y, w, h)
+                            
+                            # 初始化追蹤器
+                            success = tracker.init(frame, bbox)
+                            
                             if success:
                                 self.trackers.append(tracker)
                                 self.tracker_confidences.append(1.0)
-                        except:
+                                # print(f"✓ 追蹤器初始化成功: {bbox}")
+                            else:
+                                # Legacy 追蹤器可能需要不同的初始化方式
+                                pass
+                        except Exception as e:
+                            # print(f"追蹤器初始化錯誤: {e}")
                             pass
+                    else:
+                        # 如果無法創建追蹤器，仍然返回檢測結果
+                        pass
             
             # 合併檢測和追蹤結果
             faces = self.merge_detections_and_tracking(detected_faces, tracked_faces)
@@ -351,15 +515,25 @@ def main():
     mosaic_size = 15
     mosaic_style = 'pixelate'
     
-    print("=== 高性能人臉馬賽克 ===")
+    print("\n=== 高性能人臉馬賽克 (YOLOv11n 增強版) ===")
+    print("✓ YOLOv11n-face 深度學習檢測")
     print("✓ 智能追蹤算法")
     print("✓ 預測式遮擋")
     print("✓ 高速移動優化")
+    print("\n檢測方法:")
+    if tracker.yolo_available:
+        print("  ► YOLO (主要)")
+    if MEDIAPIPE_AVAILABLE:
+        print("  ► MediaPipe (備用)")
+    print("  ► Haar Cascade (後備)")
+    
     print("\n操作說明:")
     print("  q - 退出")
     print("  +/- - 調整強度")
     print("  1/2/3 - 切換效果")
     print("  s - 調整安全邊界")
+    print("  d - 切換檢測方法")
+    print("  SPACE - 暫停/繼續")
     
     # 性能監控
     fps_counter = 0
@@ -369,56 +543,65 @@ def main():
     # 幀時間監控
     frame_times = deque(maxlen=30)
     
+    # 暫停狀態
+    paused = False
+    
     while True:
-        frame_start = time.time()
-        
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        frame = cv2.flip(frame, 1)
-        
-        # 人臉追蹤和檢測
-        faces = tracker.update_face_tracking(frame)
-        
-        # 應用馬賽克
-        frame = apply_smart_mosaic(frame, faces, mosaic_size, mosaic_style)
-        
-        # 性能統計
-        frame_end = time.time()
-        frame_time = frame_end - frame_start
-        frame_times.append(frame_time)
-        
-        fps_counter += 1
-        if fps_counter >= 15:
-            current_fps = 15 / (time.time() - fps_timer)
-            fps_timer = time.time()
-            fps_counter = 0
-        
-        avg_frame_time = sum(frame_times) / len(frame_times) if frame_times else 0
+        if not paused:
+            frame_start = time.time()
+            
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            frame = cv2.flip(frame, 1)
+            display_frame = frame.copy()
+            
+            # 人臉追蹤和檢測
+            faces = tracker.update_face_tracking(frame)
+            
+            # 應用馬賽克
+            display_frame = apply_smart_mosaic(display_frame, faces, mosaic_size, mosaic_style)
+            
+            # 性能統計
+            frame_end = time.time()
+            frame_time = frame_end - frame_start
+            frame_times.append(frame_time)
+            
+            fps_counter += 1
+            if fps_counter >= 15:
+                current_fps = 15 / (time.time() - fps_timer)
+                fps_timer = time.time()
+                fps_counter = 0
+            
+            avg_frame_time = sum(frame_times) / len(frame_times) if frame_times else 0
+        else:
+            display_frame = frame.copy() if 'frame' in locals() else np.zeros((480, 640, 3), dtype=np.uint8)
         
         # 顯示資訊
         info_texts = [
-            f'追蹤器: {len(tracker.trackers)} 個',
-            f'檢測到: {len(faces)} 張臉',
+            f'Detection Method: {tracker.detection_method.upper()}',
+            f'Trackers: {len(tracker.trackers)}',
+            f'Faces Detected: {len(faces)}',
             f'FPS: {current_fps:.1f}',
-            f'處理時間: {avg_frame_time*1000:.1f}ms',
-            f'效果: {mosaic_style} ({mosaic_size})'
+            f'Processing Time: {avg_frame_time*1000:.1f}ms',
+            f'Effect: {mosaic_style} ({mosaic_size})',
+            f'Status: {"Paused" if paused else "Running"}'
         ]
         
         y_offset = 20
         for text in info_texts:
-            cv2.putText(frame, text, (10, y_offset), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            color = (0, 100, 255) if paused else (0, 255, 0)
+            cv2.putText(display_frame, text, (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             y_offset += 18
         
-        # 顯示追蹤狀態
-        for i, face in enumerate(faces):
-            x, y, w, h = face
-            # 繪製追蹤框（調試用，可選）
-            # cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 1)
+        # 顯示追蹤狀態（調試用，可選）
+        # for i, face in enumerate(faces):
+        #     x, y, w, h = face
+        #     cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 1)
         
-        cv2.imshow('高性能人臉馬賽克', frame)
+        cv2.imshow('高性能人臉馬賽克 - YOLOv11n', display_frame)
         
         # 按鍵處理
         key = cv2.waitKey(1) & 0xFF
@@ -442,6 +625,25 @@ def main():
         elif key == ord('s'):
             tracker.safety_margin = 1.5 if tracker.safety_margin < 1.4 else 1.2
             print(f"安全邊界: {tracker.safety_margin:.1f}x")
+        elif key == ord('d'):
+            # 切換檢測方法
+            methods = []
+            if tracker.yolo_available:
+                methods.append('yolo')
+            if MEDIAPIPE_AVAILABLE:
+                methods.append('mediapipe')
+            methods.append('haar')  # Haar 總是可用
+            
+            if len(methods) > 1:
+                current_idx = methods.index(tracker.detection_method) if tracker.detection_method in methods else 0
+                next_idx = (current_idx + 1) % len(methods)
+                tracker.detection_method = methods[next_idx]
+                print(f"切換到 {tracker.detection_method.upper()} 檢測方法")
+            else:
+                print(f"只有 {tracker.detection_method.upper()} 檢測方法可用")
+        elif key == ord(' '):
+            paused = not paused
+            print("暫停" if paused else "繼續")
     
     cap.release()
     cv2.destroyAllWindows()
