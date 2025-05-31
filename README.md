@@ -1,1 +1,1 @@
-PYTHON version 3.12 
+PYTHON version 3.10.9
