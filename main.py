@@ -1,20 +1,27 @@
+import sys
 import cv2
 import numpy as np
 import threading
 import time
+
 from collections import deque
 import os
 
-# 嘗試導入MediaPipe
-try:
-    import mediapipe as mp
-    MEDIAPIPE_AVAILABLE = True
-except ImportError:
-    MEDIAPIPE_AVAILABLE = False
-    print("建議安裝MediaPipe以獲得更好效果: pip install mediapipe")
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QPushButton, QVBoxLayout,
+    QHBoxLayout, QSlider, QComboBox
+)
+from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtGui import QImage, QPixmap
 
-class OptimizedFaceTracker:
+
+# 引入你提供的 OptimizedFaceTracker 與 apply_smart_mosaic
+# 假設你將它們放在 face_tracker_module.py 中，這裡以匯入方式使用
+from face_tracker_module import OptimizedFaceTracker, apply_smart_mosaic
+
+class VideoMosaicApp(QWidget):
     def __init__(self):
+
         # YOLO 設定
         self.yolo_model = None
         self.yolo_available = False
@@ -439,64 +446,70 @@ class OptimizedFaceTracker:
             
             # 合併檢測和追蹤結果
             faces = self.merge_detections_and_tracking(detected_faces, tracked_faces)
-        else:
-            # 只使用追蹤結果
-            faces = tracked_faces
-        
-        # 清理低信心度的追蹤器
-        self.trackers = [t for i, t in enumerate(self.trackers) if self.tracker_confidences[i] > 0.2]
-        self.tracker_confidences = [c for c in self.tracker_confidences if c > 0.2]
-        
-        return faces
+=======
+        super().__init__()
+        self.setWindowTitle("即時人臉馬賽克 GUI")
+        self.resize(800, 600)
 
-def apply_smart_mosaic(image, faces, mosaic_size=15, style='pixelate'):
-    """智能馬賽克應用（帶預測）"""
-    for face in faces:
-        x, y, w, h = face
-        
-        # 擴大保護區域
-        padding = max(10, min(w, h) // 8)
-        safe_x = max(0, x - padding)
-        safe_y = max(0, y - padding)
-        safe_w = min(image.shape[1] - safe_x, w + 2 * padding)
-        safe_h = min(image.shape[0] - safe_y, h + 2 * padding)
-        
-        if safe_w <= 5 or safe_h <= 5:
-            continue
-        
-        face_region = image[safe_y:safe_y+safe_h, safe_x:safe_x+safe_w].copy()
-        
-        if style == 'pixelate':
-            block_size = max(2, min(mosaic_size, min(safe_w, safe_h) // 8))
-            small = cv2.resize(face_region, (block_size, block_size), interpolation=cv2.INTER_LINEAR)
-            mosaic = cv2.resize(small, (safe_w, safe_h), interpolation=cv2.INTER_NEAREST)
-        elif style == 'blur':
-            kernel_size = max(5, mosaic_size * 2 + 1)
-            if kernel_size % 2 == 0:
-                kernel_size += 1
-            mosaic = cv2.GaussianBlur(face_region, (kernel_size, kernel_size), 0)
-        else:  # 'black'
-            mosaic = np.zeros_like(face_region)
-        
-        # 應用漸變邊緣以減少突兀感
-        if style != 'black':
-            mask = np.ones((safe_h, safe_w, 3), dtype=np.float32)
-            border_size = min(10, min(safe_w, safe_h) // 10)
-            
-            # 創建漸變遮罩
-            for i in range(border_size):
-                alpha = i / border_size
-                mask[i, :] *= alpha
-                mask[-(i+1), :] *= alpha
-                mask[:, i] *= alpha
-                mask[:, -(i+1)] *= alpha
-            
-            # 混合原圖和馬賽克
-            mosaic = (mosaic * mask + face_region * (1 - mask)).astype(np.uint8)
-        
-        image[safe_y:safe_y+safe_h, safe_x:safe_x+safe_w] = mosaic
-    
-    return image
+        self.label = QLabel("按下『開始』以啟動攝影機")
+        self.label.setAlignment(Qt.AlignCenter)
+
+        self.btn_start = QPushButton("開始")
+        self.btn_start.clicked.connect(self.toggle_camera)
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setMinimum(5)
+        self.slider.setMaximum(50)
+        self.slider.setValue(15)
+        self.slider.valueChanged.connect(self.update_mosaic_size)
+
+        self.style_box = QComboBox()
+        self.style_box.addItems(['pixelate', 'blur', 'black'])
+        self.style_box.currentTextChanged.connect(self.update_mosaic_style)
+
+        control_layout = QHBoxLayout()
+        control_layout.addWidget(self.btn_start)
+        control_layout.addWidget(QLabel("強度:"))
+        control_layout.addWidget(self.slider)
+        control_layout.addWidget(QLabel("樣式:"))
+        control_layout.addWidget(self.style_box)
+
+        layout = QVBoxLayout()
+        layout.addWidget(self.label)
+        layout.addLayout(control_layout)
+        self.setLayout(layout)
+
+        # 初始化追蹤器與控制參數
+        self.cap = None
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_frame)
+        self.tracker = OptimizedFaceTracker()
+        self.mosaic_size = 15
+        self.mosaic_style = 'pixelate'
+
+        self.running = False
+
+    def toggle_camera(self):
+        if not self.running:
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                self.label.setText("無法開啟攝影機")
+                return
+            self.running = True
+            self.btn_start.setText("停止")
+            self.timer.start(30)  # 約每 30ms 更新一幀
+
+        else:
+            self.running = False
+            self.btn_start.setText("開始")
+            self.timer.stop()
+            if self.cap:
+                self.cap.release()
+            self.label.setPixmap(QPixmap())  # 清空畫面
+
+    def update_mosaic_size(self, value):
+        self.mosaic_size = value
+
 
 def main():
     cap = cv2.VideoCapture(0)
@@ -648,5 +661,34 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
-if __name__ == "__main__":
-    main()
+    def update_mosaic_style(self, style):
+        self.mosaic_style = style
+
+    def update_frame(self):
+        ret, frame = self.cap.read()
+        if not ret:
+            return
+
+        frame = cv2.flip(frame, 1)
+        faces = self.tracker.update_face_tracking(frame)
+        frame = apply_smart_mosaic(frame, faces, self.mosaic_size, self.mosaic_style)
+
+        # 顯示處理資訊
+        cv2.putText(frame, f'Mosaic: {self.mosaic_style} ({self.mosaic_size})',
+                    (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(frame, f'Faces: {len(faces)}', 
+                    (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+        rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb_image.shape
+        bytes_per_line = ch * w
+        qt_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        self.label.setPixmap(QPixmap.fromImage(qt_img))
+
+    def closeEvent(self, event):
+        self.running = False
+        self.timer.stop()
+        if self.cap:
+            self.cap.release()
+        event.accept()
+
