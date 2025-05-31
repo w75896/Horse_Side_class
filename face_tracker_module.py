@@ -34,7 +34,7 @@ class OptimizedFaceTracker:
         self.trackers = []
         self.tracker_confidences = []
         self.last_detection_time = time.time()
-        self.detection_interval = 0
+        self.detection_interval = 0.03  # 每100ms進行一次完整檢測
         
         # 預測緩存
         self.face_predictions = []
@@ -140,7 +140,7 @@ class OptimizedFaceTracker:
                         w = min(width - x, w)
                         h = min(height - y, h)
                         
-                        if w > 15 and h > 15:
+                        if w > 20 and h > 20:
                             faces.append([x, y, w, h])
                             confidences.append(confidence)
             
@@ -161,7 +161,7 @@ class OptimizedFaceTracker:
             return []
     
     def create_tracker(self):
-        """創建追蹤器 - 針對 OpenCV 4.8.1 優化"""
+        """創建追蹤器 - 針對 OpenCV 4.11.0 優化"""
         try:
             # 獲取 OpenCV 版本
             cv_version = cv2.__version__.split('.')
@@ -172,12 +172,10 @@ class OptimizedFaceTracker:
             if major_version >= 4 and minor_version >= 5:
                 # 使用 legacy 追蹤器（按性能排序）
                 tracker_creators = [
-                    ('CSRT (legacy)', lambda: cv2.legacy.TrackerCSRT_create()),
-                    ('KCF (legacy)', lambda: cv2.legacy.TrackerKCF_create()),
-                    ('MOSSE (legacy)', lambda: cv2.legacy.TrackerMOSSE_create()),
-                    ('MIL (legacy)', lambda: cv2.legacy.TrackerMIL_create()),
-                    ('MEDIANFLOW (legacy)', lambda: cv2.legacy.TrackerMedianFlow_create()),
-                    ('TLD (legacy)', lambda: cv2.legacy.TrackerTLD_create()),
+                    ('CSRT', lambda: cv2.legacy.TrackerCSRT_create()),
+                    ('KCF', lambda: cv2.legacy.TrackerKCF_create()),
+                    ('MOSSE', lambda: cv2.legacy.TrackerMOSSE_create()),
+                    ('MIL', lambda: cv2.legacy.TrackerMIL_create()),
                 ]
             else:
                 # 舊版本使用標準追蹤器
@@ -191,13 +189,11 @@ class OptimizedFaceTracker:
             for tracker_name, creator_func in tracker_creators:
                 try:
                     tracker = creator_func()
-                    # print(f"成功創建 {tracker_name} 追蹤器")
                     return tracker
                 except Exception as e:
                     continue
             
             print("警告：無法創建任何追蹤器")
-            print(f"OpenCV 版本: {cv2.__version__}")
             return None
             
         except Exception as e:
@@ -294,7 +290,7 @@ class OptimizedFaceTracker:
                         width = min(w - x, int(bbox.width * w))
                         height = min(h - y, int(bbox.height * h))
                         
-                        if width > 15 and height > 15:
+                        if width > 20 and height > 20:
                             faces.append((x, y, width, height))
                     
                     if len(faces) > 0:
@@ -319,9 +315,15 @@ class OptimizedFaceTracker:
         valid_trackers = []
         valid_confidences = []
         
+        # 確保影像是彩色的
+        if len(frame.shape) == 2:
+            color_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        else:
+            color_frame = frame
+        
         for i, tracker in enumerate(self.trackers):
             try:
-                success, bbox = tracker.update(frame)
+                success, bbox = tracker.update(color_frame)
                 if success:
                     x, y, w, h = [int(v) for v in bbox]
                     # 檢查邊界
@@ -330,14 +332,9 @@ class OptimizedFaceTracker:
                         updated_faces.append((x, y, w, h))
                         valid_trackers.append(tracker)
                         valid_confidences.append(self.tracker_confidences[i] * 0.95)  # 逐漸降低信心度
-                    else:
-                        # 追蹤失敗，移除追蹤器
-                        pass
-                else:
-                    # 追蹤失敗
-                    pass
-            except:
-                # 追蹤器出錯
+            except Exception as e:
+                # 追蹤器出錯，跳過
+                print(f"追蹤器更新錯誤: {type(e).__name__}: {str(e)}")
                 pass
         
         self.trackers = valid_trackers
@@ -410,32 +407,39 @@ class OptimizedFaceTracker:
                     tracker = self.create_tracker()
                     if tracker:
                         try:
-                            # 確保座標是整數
-                            x, y, w, h = int(x), int(y), int(w), int(h)
+                            # 確保座標是整數且在有效範圍內
+                            x = max(0, int(x))
+                            y = max(0, int(y))
+                            w = min(frame.shape[1] - x, int(w))
+                            h = min(frame.shape[0] - y, int(h))
                             
-                            # 確保寬高大於最小值
+                            # 確保區域足夠大
                             if w < 20 or h < 20:
                                 continue
                             
-                            # 不要擴大初始區域，使用原始檢測框
+                            # 創建邊界框（整數元組）
                             bbox = (x, y, w, h)
                             
+                            # 確保影像是彩色的（3通道）
+                            if len(frame.shape) == 2:
+                                # 如果是灰度圖，轉換為彩色
+                                color_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+                            else:
+                                color_frame = frame
+                            
                             # 初始化追蹤器
-                            success = tracker.init(frame, bbox)
+                            success = tracker.init(color_frame, bbox)
                             
                             if success:
                                 self.trackers.append(tracker)
                                 self.tracker_confidences.append(1.0)
-                                # print(f"✓ 追蹤器初始化成功: {bbox}")
                             else:
-                                # Legacy 追蹤器可能需要不同的初始化方式
-                                pass
+                                # 如果初始化失敗，嘗試調試
+                                print(f"追蹤器初始化失敗 - bbox: {bbox}, frame shape: {frame.shape}")
                         except Exception as e:
-                            # print(f"追蹤器初始化錯誤: {e}")
-                            pass
-                    else:
-                        # 如果無法創建追蹤器，仍然返回檢測結果
-                        pass
+                            print(f"追蹤器錯誤: {type(e).__name__}: {str(e)}")
+                            import traceback
+                            traceback.print_exc()
             
             # 合併檢測和追蹤結果
             faces = self.merge_detections_and_tracking(detected_faces, tracked_faces)
@@ -499,7 +503,7 @@ def apply_smart_mosaic(image, faces, mosaic_size=15, style='pixelate'):
     return image
 
 def main():
-    cap = cv2.VideoCapture(1)
+    cap = cv2.VideoCapture(0)
     
     if not cap.isOpened():
         print("錯誤：無法開啟攝影機")
@@ -554,7 +558,7 @@ def main():
             if not ret:
                 break
             
-            # frame = cv2.flip(frame, 1)
+            frame = cv2.flip(frame, 1)
             display_frame = frame.copy()
             
             # 人臉追蹤和檢測
@@ -580,13 +584,13 @@ def main():
         
         # 顯示資訊
         info_texts = [
-            f'Detection Method: {tracker.detection_method.upper()}',
-            f'Trackers: {len(tracker.trackers)}',
-            f'Faces Detected: {len(faces)}',
+            f'檢測方法: {tracker.detection_method.upper()}',
+            f'追蹤器: {len(tracker.trackers)} 個',
+            f'檢測到: {len(faces)} 張臉',
             f'FPS: {current_fps:.1f}',
-            f'Processing Time: {avg_frame_time*1000:.1f}ms',
-            f'Effect: {mosaic_style} ({mosaic_size})',
-            f'Status: {"Paused" if paused else "Running"}'
+            f'處理時間: {avg_frame_time*1000:.1f}ms',
+            f'效果: {mosaic_style} ({mosaic_size})',
+            f'狀態: {"暫停" if paused else "運行中"}'
         ]
         
         y_offset = 20
