@@ -33,21 +33,19 @@ class OptimizedFaceTracker:
         if MEDIAPIPE_AVAILABLE:
             self.mp_face_detection = mp.solutions.face_detection
             self.face_detection = self.mp_face_detection.FaceDetection(
-                model_selection=0, min_detection_confidence=0.4  # 降低閾值增加檢測率
+                model_selection=0, min_detection_confidence=0.4 
             )
         
         # Haar分類器
         self.frontal_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
         
-        # 追蹤器管理
-        self.trackers = []
-        self.tracker_confidences = []
+        # 檢測管理
         self.last_detection_time = time.time()
-        self.detection_interval = 0.1  # 每100ms進行一次完整檢測
+        self.detection_interval = 0.05  # 每50ms進行一次檢測
         
-        # 預測緩存
-        self.face_predictions = []
-        self.velocity_cache = deque(maxlen=5)
+        # 臉部位置緩存
+        self.face_history = deque(maxlen=5)  # 保存最近5幀的檢測結果
+        self.smooth_faces = []  # 平滑後的臉部位置
         
         # 性能優化
         self.frame_skip = 0
@@ -105,8 +103,7 @@ class OptimizedFaceTracker:
             height, width = frame.shape[:2]
             
             # 預處理圖像
-            blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), 
-                                       swapRB=True, crop=False)
+            blob = cv2.dnn.blobFromImage(frame, 1/255.0, (640, 640), swapRB=True, crop=False)
             
             # 推理
             self.yolo_model.setInput(blob)
@@ -115,9 +112,6 @@ class OptimizedFaceTracker:
             # 處理輸出
             faces = []
             confidences = []
-            
-            # 打印輸出形狀以便調試
-            # print(f"YOLO output shape: {outputs.shape}")
             
             # YOLOv11 輸出格式處理
             # 通常格式是 [1, num_detections, 85] 或 [num_detections, 85]
@@ -181,88 +175,85 @@ class OptimizedFaceTracker:
             traceback.print_exc()
             return []
     
-    def create_tracker(self):
-        """創建追蹤器 - 針對 OpenCV 4.11.0 優化"""
-        try:
-            # 獲取 OpenCV 版本
-            cv_version = cv2.__version__.split('.')
-            major_version = int(cv_version[0])
-            minor_version = int(cv_version[1])
+    def expand_face_region(self, face_rect, frame_shape, margin=None):
+        """擴大人臉區域以提供安全邊界"""
+        if margin is None:
+            margin = self.safety_margin
             
-            # OpenCV 4.5+ 需要使用 legacy 追蹤器
-            if major_version >= 4 and minor_version >= 5:
-                # 使用 legacy 追蹤器（按性能排序）
-                tracker_creators = [
-                    ('CSRT', lambda: cv2.legacy.TrackerCSRT_create()),
-                    ('KCF', lambda: cv2.legacy.TrackerKCF_create()),
-                    ('MOSSE', lambda: cv2.legacy.TrackerMOSSE_create()),
-                    ('MIL', lambda: cv2.legacy.TrackerMIL_create()),
-                ]
-            else:
-                # 舊版本使用標準追蹤器
-                tracker_creators = [
-                    ('CSRT', lambda: cv2.TrackerCSRT_create()),
-                    ('KCF', lambda: cv2.TrackerKCF_create()),
-                    ('MIL', lambda: cv2.TrackerMIL_create()),
-                ]
-            
-            # 嘗試創建追蹤器
-            for tracker_name, creator_func in tracker_creators:
-                try:
-                    tracker = creator_func()
-                    return tracker
-                except Exception as e:
-                    continue
-            
-            print("警告：無法創建任何追蹤器")
-            return None
-            
-        except Exception as e:
-            print(f"創建追蹤器時發生錯誤: {e}")
-            return None
-    
-    def predict_face_position(self, face_rect, velocity):
-        """根據速度預測人臉位置"""
         x, y, w, h = face_rect
-        vx, vy = velocity
+        frame_h, frame_w = frame_shape[:2]
         
-        # 預測下一幀的位置
-        predicted_x = int(x + vx * 2)  # 預測2幀後的位置
-        predicted_y = int(y + vy * 2)
+        # 計算擴展尺寸
+        new_w = int(w * margin)
+        new_h = int(h * margin)
         
-        return (predicted_x, predicted_y, w, h)
+        # 計算新的左上角位置（保持中心點）
+        new_x = max(0, x - (new_w - w) // 2)
+        new_y = max(0, y - (new_h - h) // 2)
+        
+        # 確保不超出框架邊界
+        new_w = min(new_w, frame_w - new_x)
+        new_h = min(new_h, frame_h - new_y)
+        
+        return (new_x, new_y, new_w, new_h)
     
-    def calculate_velocity(self, current_faces, previous_faces):
-        """計算人臉移動速度"""
-        velocities = []
+    def smooth_face_positions(self, current_faces):
+        """平滑臉部位置以減少抖動"""
+        if not current_faces:
+            return []
         
-        for curr_face in current_faces:
-            cx, cy, cw, ch = curr_face
-            curr_center = (cx + cw//2, cy + ch//2)
-            
-            best_match = None
-            min_distance = float('inf')
-            
-            # 找到最匹配的前一幀人臉
-            for prev_face in previous_faces:
-                px, py, pw, ph = prev_face
-                prev_center = (px + pw//2, py + ph//2)
-                
-                distance = np.sqrt((curr_center[0] - prev_center[0])**2 + 
-                                 (curr_center[1] - prev_center[1])**2)
-                
-                if distance < min_distance and distance < 100:  # 最大匹配距離
-                    min_distance = distance
-                    best_match = prev_center
-            
-            if best_match:
-                vx = curr_center[0] - best_match[0]
-                vy = curr_center[1] - best_match[1]
-                velocities.append((vx, vy))
-            else:
-                velocities.append((0, 0))
+        # 將當前檢測結果加入歷史
+        self.face_history.append(current_faces)
         
-        return velocities
+        if len(self.face_history) < 2:
+            return current_faces
+        
+        # 計算平滑位置
+        smoothed_faces = []
+        
+        for i, face in enumerate(current_faces):
+            x, y, w, h = face
+            
+            # 找到歷史中最接近的臉部
+            smooth_x, smooth_y, smooth_w, smooth_h = x, y, w, h
+            weight_sum = 1.0
+            
+            for j, history_faces in enumerate(self.face_history):
+                if j == len(self.face_history) - 1:  # 跳過當前幀
+                    continue
+                
+                # 權重隨時間遞減
+                weight = 0.5 ** (len(self.face_history) - j - 1)
+                
+                # 找到最接近的臉
+                min_dist = float('inf')
+                best_match = None
+                
+                for hist_face in history_faces:
+                    hx, hy, hw, hh = hist_face
+                    dist = np.sqrt((x - hx)**2 + (y - hy)**2)
+                    
+                    if dist < min_dist and dist < 100:  # 最大匹配距離
+                        min_dist = dist
+                        best_match = hist_face
+                
+                if best_match is not None:
+                    hx, hy, hw, hh = best_match
+                    smooth_x += hx * weight
+                    smooth_y += hy * weight
+                    smooth_w += hw * weight
+                    smooth_h += hh * weight
+                    weight_sum += weight
+            
+            # 計算加權平均
+            smooth_x = int(smooth_x / weight_sum)
+            smooth_y = int(smooth_y / weight_sum)
+            smooth_w = int(smooth_w / weight_sum)
+            smooth_h = int(smooth_h / weight_sum)
+            
+            smoothed_faces.append((smooth_x, smooth_y, smooth_w, smooth_h))
+        
+        return smoothed_faces
     
     def analyze_face_age(self, frame, face_rect):
         """使用 DeepFace 分析年齡"""
@@ -283,7 +274,7 @@ class OptimizedFaceTracker:
             face_img = frame[y_start:y_end, x_start:x_end]
             
             # 確保圖像大小足夠
-            if face_img.shape[0] < 20 or face_img.shape[1] < 20:
+            if face_img.shape[0] < 48 or face_img.shape[1] < 48:
                 return None
             
             # 使用 DeepFace 分析年齡
@@ -397,151 +388,25 @@ class OptimizedFaceTracker:
         
         return faces
     
-    def update_trackers(self, frame):
-        """更新追蹤器"""
-        updated_faces = []
-        valid_trackers = []
-        valid_confidences = []
-        
-        # 確保影像是彩色的
-        if len(frame.shape) == 2:
-            color_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-        else:
-            color_frame = frame
-        
-        for i, tracker in enumerate(self.trackers):
-            try:
-                success, bbox = tracker.update(color_frame)
-                if success:
-                    x, y, w, h = [int(v) for v in bbox]
-                    # 檢查邊界
-                    if (x >= 0 and y >= 0 and x + w <= frame.shape[1] and 
-                        y + h <= frame.shape[0] and w > 10 and h > 10):
-                        updated_faces.append((x, y, w, h))
-                        valid_trackers.append(tracker)
-                        valid_confidences.append(self.tracker_confidences[i] * 0.95)  # 逐漸降低信心度
-            except Exception as e:
-                # 追蹤器出錯，跳過
-                print(f"追蹤器更新錯誤: {type(e).__name__}: {str(e)}")
-                pass
-        
-        self.trackers = valid_trackers
-        self.tracker_confidences = valid_confidences
-        
-        return updated_faces
-    
-    def merge_detections_and_tracking(self, detected_faces, tracked_faces):
-        """合併檢測和追蹤結果"""
-        all_faces = []
-        
-        # 添加檢測到的人臉
-        for face in detected_faces:
-            all_faces.append((face, 1.0, 'detected'))
-        
-        # 添加追蹤的人臉（如果沒有重疊的檢測結果）
-        for i, tracked_face in enumerate(tracked_faces):
-            tx, ty, tw, th = tracked_face
-            is_duplicate = False
-            
-            for detected_face in detected_faces:
-                dx, dy, dw, dh = detected_face
-                
-                # 計算重疊
-                overlap_x = max(0, min(tx + tw, dx + dw) - max(tx, dx))
-                overlap_y = max(0, min(ty + th, dy + dh) - max(ty, dy))
-                overlap_area = overlap_x * overlap_y
-                
-                if overlap_area > 0.3 * min(tw * th, dw * dh):
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate and self.tracker_confidences[i] > 0.3:
-                all_faces.append((tracked_face, self.tracker_confidences[i], 'tracked'))
-        
-        # 只返回人臉區域
-        return [face for face, conf, source in all_faces if conf > 0.2]
-    
-    def update_face_tracking(self, frame):
-        #暫時取消追蹤器
-        return self.fast_detect_faces(frame)
-        """主要的人臉追蹤更新方法"""
+    def update_face_detection(self, frame):
+        """更新人臉檢測（無追蹤器版本）"""
         current_time = time.time()
-        faces = []
         
-        # 更新現有追蹤器
-        tracked_faces = self.update_trackers(frame)
-        
-        # 決定是否進行新的檢測
-        should_detect = (current_time - self.last_detection_time > self.detection_interval or 
-                        len(self.trackers) == 0)
-        
-        if should_detect:
-            # 進行新的檢測
-            detected_faces = self.fast_detect_faces(frame)
+        # 檢查是否需要進行新的檢測
+        if current_time - self.last_detection_time >= self.detection_interval:
+            # 進行檢測
+            faces = self.fast_detect_faces(frame)
             self.last_detection_time = current_time
             
-            # 為新檢測到的人臉創建追蹤器
-            for face in detected_faces:
-                x, y, w, h = face
-                
-                # 檢查是否已經有追蹤器追蹤類似區域
-                is_new_face = True
-                for tracked_face in tracked_faces:
-                    tx, ty, tw, th = tracked_face
-                    distance = np.sqrt((x - tx)**2 + (y - ty)**2)
-                    if distance < 50:  # 如果距離很近，認為是同一張臉
-                        is_new_face = False
-                        break
-                
-                if is_new_face:
-                    tracker = self.create_tracker()
-                    if tracker:
-                        try:
-                            # 確保座標是整數且在有效範圍內
-                            x = max(0, int(x))
-                            y = max(0, int(y))
-                            w = min(frame.shape[1] - x, int(w))
-                            h = min(frame.shape[0] - y, int(h))
-                            
-                            # 確保區域足夠大
-                            if w < 20 or h < 20:
-                                continue
-                            
-                            # 創建邊界框（整數元組）
-                            bbox = (x, y, w, h)
-                            
-                            # 確保影像是彩色的（3通道）
-                            if len(frame.shape) == 2:
-                                # 如果是灰度圖，轉換為彩色
-                                color_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                            else:
-                                color_frame = frame
-                            
-                            # 初始化追蹤器
-                            success = tracker.init(color_frame, bbox)
-                            
-                            if success:
-                                self.trackers.append(tracker)
-                                self.tracker_confidences.append(1.0)
-                            else:
-                                # 如果初始化失敗，嘗試調試
-                                print(f"追蹤器初始化失敗 - bbox: {bbox}, frame shape: {frame.shape}")
-                        except Exception as e:
-                            print(f"追蹤器錯誤: {type(e).__name__}: {str(e)}")
-                            import traceback
-                            traceback.print_exc()
+            # 平滑臉部位置
+            if faces is not None:
+                faces = self.smooth_face_positions(faces)
             
-            # 合併檢測和追蹤結果
-            faces = self.merge_detections_and_tracking(detected_faces, tracked_faces)
+            self.smooth_faces = faces
+            return faces
         else:
-            # 只使用追蹤結果
-            faces = tracked_faces
-        
-        # 清理低信心度的追蹤器
-        self.trackers = [t for i, t in enumerate(self.trackers) if self.tracker_confidences[i] > 0.2]
-        self.tracker_confidences = [c for c in self.tracker_confidences if c > 0.2]
-        
-        return faces
+            # 返回上次檢測的結果
+            return self.smooth_faces
 
 def apply_smart_mosaic(image, faces, mosaic_size=15, style='pixelate', tracker=None):
     """智能馬賽克應用（支援小孩保護功能）"""
@@ -599,7 +464,7 @@ def apply_smart_mosaic(image, faces, mosaic_size=15, style='pixelate', tracker=N
     return image
 
 def main():
-    cap = cv2.VideoCapture(2)
+    cap = cv2.VideoCapture(0)
     
     if not cap.isOpened():
         print("錯誤：無法開啟攝影機")
@@ -615,11 +480,11 @@ def main():
     mosaic_size = 15
     mosaic_style = 'pixelate'
     
-    print("\n=== 高性能人臉馬賽克 (YOLOv11n 增強版) ===")
+    print("\n=== 高性能人臉馬賽克 (優化版) ===")
     print("✓ YOLOv11n-face 深度學習檢測")
-    print("✓ 智能追蹤算法")
-    print("✓ 預測式遮擋")
-    print("✓ 高速移動優化")
+    print("✓ 位置平滑算法")
+    print("✓ 小孩保護功能")
+    print("✓ 高速處理優化")
     print("\n檢測方法:")
     if tracker.yolo_available:
         print("  ► YOLO (主要)")
@@ -656,11 +521,11 @@ def main():
             if not ret:
                 break
             
-            # frame = cv2.flip(frame, 1)
+            frame = cv2.flip(frame, 1)
             display_frame = frame.copy()
             
-            # 人臉追蹤和檢測
-            faces = tracker.update_face_tracking(frame)
+            # 人臉檢測
+            faces = tracker.update_face_detection(frame)
             
             # 應用馬賽克
             display_frame = apply_smart_mosaic(display_frame, faces, mosaic_size, mosaic_style, tracker)
@@ -683,14 +548,12 @@ def main():
         # 顯示資訊
         info_texts = [
             f'Detection Method: {tracker.detection_method.upper()}',
-            f'Trackers: {len(tracker.trackers)}',
             f'Detected Faces: {len(faces)}',
             f'FPS: {current_fps:.1f}',
             f'Processing Time: {avg_frame_time*1000:.1f}ms',
             f'Effect: {mosaic_style} ({mosaic_size})',
             f'Child Protection: {"Enabled" if tracker.child_protection_enabled else "Disabled"}',
         ]
-        
         if tracker.child_protection_enabled and DEEPFACE_AVAILABLE:
             info_texts.append(f'Age Threshold: {tracker.age_threshold} years')
             # 顯示檢測到的年齡資訊
@@ -713,10 +576,10 @@ def main():
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             y_offset += 18
         
-        # 顯示追蹤狀態（調試用，可選）
-        for i, face in enumerate(faces):
-            x, y, w, h = face
-            cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 1)
+        # 顯示追蹤狀態
+        # for i, face in enumerate(faces):
+        #     x, y, w, h = face
+        #     cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 1)
         
         cv2.imshow('高性能人臉馬賽克 - YOLOv11n', display_frame)
         
