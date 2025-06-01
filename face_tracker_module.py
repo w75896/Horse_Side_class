@@ -32,17 +32,39 @@ class VideoRecorder:
         self.start_time = None
         self.frame_count = 0
         
-        # 錄製設定
-        self.fps = 30
+        # 錄製設定 - 動態FPS
+        self.target_fps = 30  # 目標FPS
+        self.actual_fps = 30  # 實際FPS（動態調整）
         self.frame_size = (640, 480)
         self.codec = cv2.VideoWriter_fourcc(*'mp4v')
+        
+        # FPS 監控
+        self.fps_history = deque(maxlen=30)  # 最近30幀的FPS記錄
+        self.last_fps_update = time.time()
+        self.fps_update_interval = 1.0  # 每秒更新一次FPS
         
         # 確保輸出目錄存在
         self.output_dir = "recorded_videos"
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
     
-    def start_recording(self, frame_size=None):
+    def update_fps(self, current_fps):
+        """更新實際FPS"""
+        current_time = time.time()
+        
+        # 記錄FPS歷史
+        if current_fps > 0:
+            self.fps_history.append(current_fps)
+        
+        # 定期更新實際FPS
+        if current_time - self.last_fps_update >= self.fps_update_interval:
+            if len(self.fps_history) > 0:
+                # 使用最近的平均FPS，但限制在合理範圍內
+                avg_fps = sum(self.fps_history) / len(self.fps_history)
+                self.actual_fps = max(5, min(60, avg_fps))  # 限制在5-60 FPS之間
+            self.last_fps_update = current_time
+    
+    def start_recording(self, frame_size=None, current_fps=None):
         """開始錄製"""
         if self.recording:
             print("⚠️ 已在錄製中")
@@ -51,15 +73,19 @@ class VideoRecorder:
         if frame_size:
             self.frame_size = frame_size
         
+        # 設定實際FPS
+        if current_fps and current_fps > 0:
+            self.actual_fps = max(5, min(60, current_fps))
+        
         # 生成檔案名稱
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.output_filename = os.path.join(self.output_dir, f"mosaic_video_{timestamp}.mp4")
         
-        # 初始化VideoWriter
+        # 初始化VideoWriter，使用實際FPS
         self.video_writer = cv2.VideoWriter(
             self.output_filename,
             self.codec,
-            self.fps,
+            self.actual_fps,  # 使用實際FPS
             self.frame_size
         )
         
@@ -70,7 +96,10 @@ class VideoRecorder:
         self.recording = True
         self.start_time = time.time()
         self.frame_count = 0
+        self.fps_history.clear()  # 清空FPS歷史
+        
         print(f"🎬 開始錄製: {self.output_filename}")
+        print(f"   設定FPS: {self.actual_fps:.1f}")
         return True
     
     def write_frame(self, frame):
@@ -98,12 +127,15 @@ class VideoRecorder:
             self.video_writer = None
         
         duration = time.time() - self.start_time if self.start_time else 0
+        estimated_video_duration = self.frame_count / self.actual_fps if self.actual_fps > 0 else 0
         
         print(f"🎯 錄製完成!")
         print(f"   檔案: {self.output_filename}")
-        print(f"   時長: {duration:.1f} 秒")
-        print(f"   幀數: {self.frame_count}")
-        print(f"   平均FPS: {self.frame_count/duration:.1f}" if duration > 0 else "")
+        print(f"   實際錄製時長: {duration:.1f} 秒")
+        print(f"   影片播放時長: {estimated_video_duration:.1f} 秒")
+        print(f"   總幀數: {self.frame_count}")
+        print(f"   錄製FPS: {self.frame_count/duration:.1f}" if duration > 0 else "")
+        print(f"   影片FPS: {self.actual_fps:.1f}")
         
         return self.output_filename
     
@@ -113,11 +145,15 @@ class VideoRecorder:
             return None
         
         duration = time.time() - self.start_time if self.start_time else 0
+        estimated_video_duration = self.frame_count / self.actual_fps if self.actual_fps > 0 else 0
+        
         return {
             'filename': os.path.basename(self.output_filename),
             'duration': duration,
             'frame_count': self.frame_count,
-            'fps': self.frame_count / duration if duration > 0 else 0
+            'fps': self.frame_count / duration if duration > 0 else 0,
+            'actual_fps': self.actual_fps,
+            'estimated_video_duration': estimated_video_duration
         }
 
 class OptimizedFaceTracker:
@@ -487,7 +523,7 @@ class OptimizedFaceTracker:
         return faces
     
     def update_face_detection(self, frame):
-        """更新人臉檢測"""
+        """更新人臉檢測（無追蹤器版本）"""
         current_time = time.time()
         
         # 檢查是否需要進行新的檢測
@@ -633,8 +669,9 @@ def main():
             # 應用馬賽克
             display_frame = apply_smart_mosaic(display_frame, faces, mosaic_size, mosaic_style, tracker)
             
-            # 寫入錄影幀
+            # 更新錄影器的FPS資訊
             if recorder.recording:
+                recorder.update_fps(current_fps)
                 recorder.write_frame(display_frame)
             
             # 性能統計
@@ -668,7 +705,8 @@ def main():
             if rec_info:
                 info_texts.extend([
                     f'🎬 Recording: {rec_info["filename"]}',
-                    f'Duration: {rec_info["duration"]:.1f}s | Frames: {rec_info["frame_count"]}'
+                    f'Real Time: {rec_info["duration"]:.1f}s | Video Time: {rec_info["estimated_video_duration"]:.1f}s',
+                    f'Frames: {rec_info["frame_count"]} | Video FPS: {rec_info["actual_fps"]:.1f}'
                 ])
         else:
             info_texts.append('📹 Press R to start recording')
@@ -764,7 +802,7 @@ def main():
                     print(f"影片已儲存至: {output_file}")
             else:
                 frame_size = (display_frame.shape[1], display_frame.shape[0])
-                if recorder.start_recording(frame_size):
+                if recorder.start_recording(frame_size, current_fps):
                     print("開始錄影...")
                 else:
                     print("錄影啟動失敗")
@@ -799,7 +837,7 @@ def main():
             # 調整年齡閾值
             if DEEPFACE_AVAILABLE:
                 print(f"當前年齡閾值: {tracker.age_threshold}")
-                print("輸入新的年齡閾值 (建議 16-21):")
+                print("輸入新的年齡閾值:")
                 try:
                     # 簡單的輸入處理
                     age_input = ""
