@@ -709,7 +709,7 @@ def main():
                     f'Frames: {rec_info["frame_count"]} | Video FPS: {rec_info["actual_fps"]:.1f}'
                 ])
         else:
-            info_texts.append('📹 Press R to start recording')
+            info_texts.append('Press R to start recording')
         
         if tracker.child_protection_enabled and DEEPFACE_AVAILABLE:
             info_texts.append(f'Age Threshold: {tracker.age_threshold} years')
@@ -748,7 +748,7 @@ def main():
                 cv2.putText(display_frame, "REC", (display_frame.shape[1] - 60, 50), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         
-        cv2.imshow('高性能人臉馬賽克 - YOLOv11n (含錄影)', display_frame)
+        cv2.imshow('及時人臉馬賽克', display_frame)
         
         # 按鍵處理
         key = cv2.waitKey(1) & 0xFF
