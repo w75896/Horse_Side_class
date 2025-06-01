@@ -12,7 +12,7 @@ try:
     DEEPFACE_AVAILABLE = True
 except ImportError:
     DEEPFACE_AVAILABLE = False
-    print("⚠️  DeepFace 未安裝，小孩保護功能不可用")
+    print("  DeepFace 未安裝，小孩保護功能不可用")
     print("   安裝方式: pip install deepface")
 
 # 嘗試導入MediaPipe
@@ -67,7 +67,7 @@ class VideoRecorder:
     def start_recording(self, frame_size=None, current_fps=None):
         """開始錄製"""
         if self.recording:
-            print("⚠️ 已在錄製中")
+            print(" 已在錄製中")
             return False
         
         if frame_size:
@@ -90,7 +90,7 @@ class VideoRecorder:
         )
         
         if not self.video_writer.isOpened():
-            print("❌ 無法初始化影片寫入器")
+            print("無法初始化影片寫入器")
             return False
         
         self.recording = True
@@ -98,7 +98,7 @@ class VideoRecorder:
         self.frame_count = 0
         self.fps_history.clear()  # 清空FPS歷史
         
-        print(f"🎬 開始錄製: {self.output_filename}")
+        print(f" 開始錄製: {self.output_filename}")
         print(f"   設定FPS: {self.actual_fps:.1f}")
         return True
     
@@ -117,7 +117,7 @@ class VideoRecorder:
     def stop_recording(self):
         """停止錄製"""
         if not self.recording:
-            print("⚠️ 目前未在錄製")
+            print("目前未在錄製")
             return None
         
         self.recording = False
@@ -129,7 +129,7 @@ class VideoRecorder:
         duration = time.time() - self.start_time if self.start_time else 0
         estimated_video_duration = self.frame_count / self.actual_fps if self.actual_fps > 0 else 0
         
-        print(f"🎯 錄製完成!")
+        print(f"錄製完成!")
         print(f"   檔案: {self.output_filename}")
         print(f"   實際錄製時長: {duration:.1f} 秒")
         print(f"   影片播放時長: {estimated_video_duration:.1f} 秒")
@@ -201,7 +201,7 @@ class OptimizedFaceTracker:
         # DeepFace 設定
         if DEEPFACE_AVAILABLE:
             self.deepface_backend = 'opencv'  # 使用 opencv 後端以提高速度
-            print("✓ DeepFace 已載入，小孩保護功能可用")
+            print(" DeepFace 已載入，小孩保護功能可用")
         
     def init_yolo(self):
         """初始化 YOLO 模型"""
@@ -210,22 +210,22 @@ class OptimizedFaceTracker:
             if os.path.exists(model_path):
                 self.yolo_model = cv2.dnn.readNetFromONNX(model_path)
                 self.yolo_available = True
-                print("✓ YOLOv11n-face 模型載入成功")
+                print(" YOLOv11n-face 模型載入成功")
                 
                 # 設定運算後端
                 if cv2.cuda.getCudaEnabledDeviceCount() > 0:
                     self.yolo_model.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
                     self.yolo_model.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                    print("✓ 使用 CUDA 加速")
+                    print(" 使用 CUDA 加速")
                 else:
                     self.yolo_model.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                     self.yolo_model.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-                    print("✓ 使用 CPU 運算")
+                    print(" 使用 CPU 運算")
             else:
-                print(f"⚠️ 找不到 YOLO 模型檔案: {model_path}")
+                print(f"找不到 YOLO 模型檔案: {model_path}")
                 print("  請確保 yolov11n-face.onnx 在程式同目錄下")
         except Exception as e:
-            print(f"⚠️ YOLO 模型載入失敗: {e}")
+            print(f"YOLO 模型載入失敗: {e}")
             self.yolo_available = False
     
     def detect_faces_yolo(self, frame):
@@ -616,12 +616,7 @@ def main():
     mosaic_size = 15
     mosaic_style = 'pixelate'
     
-    print("\n=== 高性能人臣馬賽克 (優化版 + 錄影功能) ===")
-    print("✓ YOLOv11n-face 深度學習檢測")
-    print("✓ 位置平滑算法")
-    print("✓ 小孩保護功能")
-    print("✓ 高速處理優化")
-    print("✓ 影片錄製匯出")
+    print("\n===即時人臉馬賽克===")
     print("\n檢測方法:")
     if tracker.yolo_available:
         print("  ► YOLO (主要)")
@@ -669,7 +664,7 @@ def main():
             # 應用馬賽克
             display_frame = apply_smart_mosaic(display_frame, faces, mosaic_size, mosaic_style, tracker)
             
-            # 更新錄影器的FPS資訊
+            # 更新錄影的FPS資訊
             if recorder.recording:
                 recorder.update_fps(current_fps)
                 recorder.write_frame(display_frame)
@@ -748,7 +743,7 @@ def main():
                 cv2.putText(display_frame, "REC", (display_frame.shape[1] - 60, 50), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         
-        cv2.imshow('及時人臉馬賽克', display_frame)
+        cv2.imshow('即時人臉馬賽克', display_frame)
         
         # 按鍵處理
         key = cv2.waitKey(1) & 0xFF
@@ -782,8 +777,7 @@ def main():
                 methods.append('yolo')
             if MEDIAPIPE_AVAILABLE:
                 methods.append('mediapipe')
-            methods.append('haar')  # Haar 總是可用
-            
+            methods.append('haar')  
             if len(methods) > 1:
                 current_idx = methods.index(tracker.detection_method) if tracker.detection_method in methods else 0
                 next_idx = (current_idx + 1) % len(methods)
