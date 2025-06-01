@@ -5,6 +5,15 @@ import time
 from collections import deque
 import os
 
+# 嘗試導入 DeepFace
+try:
+    from deepface import DeepFace
+    DEEPFACE_AVAILABLE = True
+except ImportError:
+    DEEPFACE_AVAILABLE = False
+    print("⚠️  DeepFace 未安裝，小孩保護功能不可用")
+    print("   安裝方式: pip install deepface")
+
 # 嘗試導入MediaPipe
 try:
     import mediapipe as mp
@@ -34,7 +43,7 @@ class OptimizedFaceTracker:
         self.trackers = []
         self.tracker_confidences = []
         self.last_detection_time = time.time()
-        self.detection_interval = 0.03  # 每100ms進行一次完整檢測
+        self.detection_interval = 0.1  # 每100ms進行一次完整檢測
         
         # 預測緩存
         self.face_predictions = []
@@ -49,6 +58,18 @@ class OptimizedFaceTracker:
         
         # 檢測方法優先級
         self.detection_method = 'yolo'  # 'yolo', 'mediapipe', 'haar'
+        
+        # 小孩保護功能
+        self.child_protection_enabled = False
+        self.age_threshold = 18  # 18歲以下視為小孩
+        self.face_age_cache = {}  # 緩存年齡檢測結果
+        self.age_detection_interval = 2.0  # 每2秒重新檢測年齡
+        self.last_age_detection = {}  # 記錄每張臉的最後檢測時間
+        
+        # DeepFace 設定
+        if DEEPFACE_AVAILABLE:
+            self.deepface_backend = 'opencv'  # 使用 opencv 後端以提高速度
+            print("✓ DeepFace 已載入，小孩保護功能可用")
         
     def init_yolo(self):
         """初始化 YOLO 模型"""
@@ -243,27 +264,94 @@ class OptimizedFaceTracker:
         
         return velocities
     
-    def expand_face_region(self, face_rect, frame_shape, margin=None):
-        """擴大人臉區域以提供安全邊界"""
-        if margin is None:
-            margin = self.safety_margin
+    def analyze_face_age(self, frame, face_rect):
+        """使用 DeepFace 分析年齡"""
+        if not DEEPFACE_AVAILABLE or not self.child_protection_enabled:
+            return None
+        
+        try:
+            x, y, w, h = face_rect
             
+            # 稍微擴大區域以確保包含完整的臉
+            padding = int(min(w, h) * 0.2)
+            x_start = max(0, x - padding)
+            y_start = max(0, y - padding)
+            x_end = min(frame.shape[1], x + w + padding)
+            y_end = min(frame.shape[0], y + h + padding)
+            
+            # 提取臉部區域
+            face_img = frame[y_start:y_end, x_start:x_end]
+            
+            # 確保圖像大小足夠
+            if face_img.shape[0] < 20 or face_img.shape[1] < 20:
+                return None
+            
+            # 使用 DeepFace 分析年齡
+            result = DeepFace.analyze(
+                img_path=face_img,
+                actions=['age'],
+                enforce_detection=False,
+                detector_backend=self.deepface_backend,
+                silent=True
+            )
+            
+            # 提取年齡
+            if isinstance(result, list):
+                age = result[0]['age']
+            else:
+                age = result['age']
+            
+            return age
+            
+        except Exception as e:
+            # 年齡檢測失敗，默認返回 None
+            return None
+    
+    def get_face_hash(self, face_rect):
+        """生成臉部位置的哈希值用於緩存"""
         x, y, w, h = face_rect
-        frame_h, frame_w = frame_shape[:2]
+        # 使用中心點和大小作為標識
+        return f"{x+w//2}_{y+h//2}_{w}_{h}"
+    
+    def should_apply_mosaic(self, frame, face_rect):
+        """判斷是否應該對該臉部應用馬賽克"""
+        if not self.child_protection_enabled:
+            # 如果未啟用小孩保護，對所有人臉應用馬賽克
+            return True
         
-        # 計算擴展尺寸
-        new_w = int(w * margin)
-        new_h = int(h * margin)
+        if not DEEPFACE_AVAILABLE:
+            # 如果 DeepFace 不可用，為安全起見對所有人臉應用馬賽克
+            return True
         
-        # 計算新的左上角位置（保持中心點）
-        new_x = max(0, x - (new_w - w) // 2)
-        new_y = max(0, y - (new_h - h) // 2)
+        # 生成臉部標識
+        face_hash = self.get_face_hash(face_rect)
+        current_time = time.time()
         
-        # 確保不超出框架邊界
-        new_w = min(new_w, frame_w - new_x)
-        new_h = min(new_h, frame_h - new_y)
+        # 檢查緩存
+        if face_hash in self.face_age_cache:
+            last_time = self.last_age_detection.get(face_hash, 0)
+            # 如果在緩存時間內，使用緩存結果
+            if current_time - last_time < self.age_detection_interval:
+                age = self.face_age_cache[face_hash]
+                return age is None or age < self.age_threshold
         
-        return (new_x, new_y, new_w, new_h)
+        # 分析年齡
+        age = self.analyze_face_age(frame, face_rect)
+        
+        # 更新緩存
+        self.face_age_cache[face_hash] = age
+        self.last_age_detection[face_hash] = current_time
+        
+        # 清理舊緩存（保留最近的50個）
+        if len(self.face_age_cache) > 50:
+            # 按時間排序，刪除最舊的
+            sorted_faces = sorted(self.last_age_detection.items(), key=lambda x: x[1])
+            for old_face, _ in sorted_faces[:len(sorted_faces)-50]:
+                self.face_age_cache.pop(old_face, None)
+                self.last_age_detection.pop(old_face, None)
+        
+        # 如果年齡檢測失敗或年齡小於閾值，應用馬賽克
+        return age is None or age < self.age_threshold
     
     def fast_detect_faces(self, frame):
         """快速人臉檢測（支援多種方法）"""
@@ -290,7 +378,7 @@ class OptimizedFaceTracker:
                         width = min(w - x, int(bbox.width * w))
                         height = min(h - y, int(bbox.height * h))
                         
-                        if width > 20 and height > 20:
+                        if width > 15 and height > 15:
                             faces.append((x, y, width, height))
                     
                     if len(faces) > 0:
@@ -374,6 +462,8 @@ class OptimizedFaceTracker:
         return [face for face, conf, source in all_faces if conf > 0.2]
     
     def update_face_tracking(self, frame):
+        #暫時取消追蹤器
+        return self.fast_detect_faces(frame)
         """主要的人臉追蹤更新方法"""
         current_time = time.time()
         faces = []
@@ -453,10 +543,16 @@ class OptimizedFaceTracker:
         
         return faces
 
-def apply_smart_mosaic(image, faces, mosaic_size=15, style='pixelate'):
-    """智能馬賽克應用（帶預測）"""
-    for face in faces:
+def apply_smart_mosaic(image, faces, mosaic_size=15, style='pixelate', tracker=None):
+    """智能馬賽克應用（支援小孩保護功能）"""
+    for i, face in enumerate(faces):
         x, y, w, h = face
+        
+        # 檢查是否應該應用馬賽克
+        if tracker and hasattr(tracker, 'should_apply_mosaic'):
+            if not tracker.should_apply_mosaic(image, face):
+                # 如果是大人且啟用小孩保護，跳過馬賽克
+                continue
         
         # 擴大保護區域
         padding = max(10, min(w, h) // 8)
@@ -503,7 +599,7 @@ def apply_smart_mosaic(image, faces, mosaic_size=15, style='pixelate'):
     return image
 
 def main():
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(2)
     
     if not cap.isOpened():
         print("錯誤：無法開啟攝影機")
@@ -537,6 +633,8 @@ def main():
     print("  1/2/3 - 切換效果")
     print("  s - 調整安全邊界")
     print("  d - 切換檢測方法")
+    print("  c - 切換小孩保護模式")
+    print("  a - 調整年齡閾值")
     print("  SPACE - 暫停/繼續")
     
     # 性能監控
@@ -558,14 +656,14 @@ def main():
             if not ret:
                 break
             
-            frame = cv2.flip(frame, 1)
+            # frame = cv2.flip(frame, 1)
             display_frame = frame.copy()
             
             # 人臉追蹤和檢測
             faces = tracker.update_face_tracking(frame)
             
             # 應用馬賽克
-            display_frame = apply_smart_mosaic(display_frame, faces, mosaic_size, mosaic_style)
+            display_frame = apply_smart_mosaic(display_frame, faces, mosaic_size, mosaic_style, tracker)
             
             # 性能統計
             frame_end = time.time()
@@ -584,14 +682,29 @@ def main():
         
         # 顯示資訊
         info_texts = [
-            f'檢測方法: {tracker.detection_method.upper()}',
-            f'追蹤器: {len(tracker.trackers)} 個',
-            f'檢測到: {len(faces)} 張臉',
+            f'Detection Method: {tracker.detection_method.upper()}',
+            f'Trackers: {len(tracker.trackers)}',
+            f'Detected Faces: {len(faces)}',
             f'FPS: {current_fps:.1f}',
-            f'處理時間: {avg_frame_time*1000:.1f}ms',
-            f'效果: {mosaic_style} ({mosaic_size})',
-            f'狀態: {"暫停" if paused else "運行中"}'
+            f'Processing Time: {avg_frame_time*1000:.1f}ms',
+            f'Effect: {mosaic_style} ({mosaic_size})',
+            f'Child Protection: {"Enabled" if tracker.child_protection_enabled else "Disabled"}',
         ]
+        
+        if tracker.child_protection_enabled and DEEPFACE_AVAILABLE:
+            info_texts.append(f'Age Threshold: {tracker.age_threshold} years')
+            # 顯示檢測到的年齡資訊
+            detected_ages = []
+            for face in faces[:3]:  # 只顯示前3個
+                face_hash = tracker.get_face_hash(face)
+                if face_hash in tracker.face_age_cache:
+                    age = tracker.face_age_cache[face_hash]
+                    if age is not None:
+                        detected_ages.append(int(age))
+            if detected_ages:
+                info_texts.append(f'Detected Ages: {", ".join(map(str, detected_ages))}')
+        
+        info_texts.append(f'Status: {"Paused" if paused else "Running"}')
         
         y_offset = 20
         for text in info_texts:
@@ -601,9 +714,9 @@ def main():
             y_offset += 18
         
         # 顯示追蹤狀態（調試用，可選）
-        # for i, face in enumerate(faces):
-        #     x, y, w, h = face
-        #     cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 1)
+        for i, face in enumerate(faces):
+            x, y, w, h = face
+            cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 1)
         
         cv2.imshow('高性能人臉馬賽克 - YOLOv11n', display_frame)
         
@@ -648,6 +761,50 @@ def main():
         elif key == ord(' '):
             paused = not paused
             print("暫停" if paused else "繼續")
+        elif key == ord('c'):
+            # 切換小孩保護模式
+            if DEEPFACE_AVAILABLE:
+                tracker.child_protection_enabled = not tracker.child_protection_enabled
+                print(f"小孩保護模式: {'開啟' if tracker.child_protection_enabled else '關閉'}")
+                if tracker.child_protection_enabled:
+                    print(f"將只對 {tracker.age_threshold} 歲以下的臉部應用馬賽克")
+                # 清空年齡緩存
+                tracker.face_age_cache.clear()
+                tracker.last_age_detection.clear()
+            else:
+                print("DeepFace 未安裝，無法使用小孩保護功能")
+                print("安裝方式: pip install deepface")
+        elif key == ord('a'):
+            # 調整年齡閾值
+            if DEEPFACE_AVAILABLE:
+                print(f"當前年齡閾值: {tracker.age_threshold}")
+                print("輸入新的年齡閾值 (建議 16-21):")
+                try:
+                    # 簡單的輸入處理
+                    age_input = ""
+                    while True:
+                        k = cv2.waitKey(0) & 0xFF
+                        if k == 13:  # Enter
+                            break
+                        elif k == 8:  # Backspace
+                            age_input = age_input[:-1]
+                        elif 48 <= k <= 57:  # 數字
+                            age_input += chr(k)
+                        elif k == 27:  # ESC
+                            age_input = ""
+                            break
+                    
+                    if age_input:
+                        new_age = int(age_input)
+                        if 1 <= new_age <= 100:
+                            tracker.age_threshold = new_age
+                            tracker.face_age_cache.clear()
+                            tracker.last_age_detection.clear()
+                            print(f"年齡閾值設為: {tracker.age_threshold}")
+                        else:
+                            print("年齡必須在 1-100 之間")
+                except:
+                    print("輸入無效")
     
     cap.release()
     cv2.destroyAllWindows()
