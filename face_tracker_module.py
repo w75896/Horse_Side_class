@@ -4,6 +4,7 @@ import threading
 import time
 from collections import deque
 import os
+from datetime import datetime
 
 # 嘗試導入 DeepFace
 try:
@@ -21,6 +22,103 @@ try:
 except ImportError:
     MEDIAPIPE_AVAILABLE = False
     print("建議安裝MediaPipe以獲得更好效果: pip install mediapipe")
+
+class VideoRecorder:
+    """影片錄製管理器"""
+    def __init__(self):
+        self.recording = False
+        self.video_writer = None
+        self.output_filename = None
+        self.start_time = None
+        self.frame_count = 0
+        
+        # 錄製設定
+        self.fps = 30
+        self.frame_size = (640, 480)
+        self.codec = cv2.VideoWriter_fourcc(*'mp4v')
+        
+        # 確保輸出目錄存在
+        self.output_dir = "recorded_videos"
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+    
+    def start_recording(self, frame_size=None):
+        """開始錄製"""
+        if self.recording:
+            print("⚠️ 已在錄製中")
+            return False
+        
+        if frame_size:
+            self.frame_size = frame_size
+        
+        # 生成檔案名稱
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.output_filename = os.path.join(self.output_dir, f"mosaic_video_{timestamp}.mp4")
+        
+        # 初始化VideoWriter
+        self.video_writer = cv2.VideoWriter(
+            self.output_filename,
+            self.codec,
+            self.fps,
+            self.frame_size
+        )
+        
+        if not self.video_writer.isOpened():
+            print("❌ 無法初始化影片寫入器")
+            return False
+        
+        self.recording = True
+        self.start_time = time.time()
+        self.frame_count = 0
+        print(f"🎬 開始錄製: {self.output_filename}")
+        return True
+    
+    def write_frame(self, frame):
+        """寫入一幀"""
+        if not self.recording or self.video_writer is None:
+            return
+        
+        # 確保幀大小正確
+        if frame.shape[:2] != (self.frame_size[1], self.frame_size[0]):
+            frame = cv2.resize(frame, self.frame_size)
+        
+        self.video_writer.write(frame)
+        self.frame_count += 1
+    
+    def stop_recording(self):
+        """停止錄製"""
+        if not self.recording:
+            print("⚠️ 目前未在錄製")
+            return None
+        
+        self.recording = False
+        
+        if self.video_writer:
+            self.video_writer.release()
+            self.video_writer = None
+        
+        duration = time.time() - self.start_time if self.start_time else 0
+        
+        print(f"🎯 錄製完成!")
+        print(f"   檔案: {self.output_filename}")
+        print(f"   時長: {duration:.1f} 秒")
+        print(f"   幀數: {self.frame_count}")
+        print(f"   平均FPS: {self.frame_count/duration:.1f}" if duration > 0 else "")
+        
+        return self.output_filename
+    
+    def get_recording_info(self):
+        """獲取錄製資訊"""
+        if not self.recording:
+            return None
+        
+        duration = time.time() - self.start_time if self.start_time else 0
+        return {
+            'filename': os.path.basename(self.output_filename),
+            'duration': duration,
+            'frame_count': self.frame_count,
+            'fps': self.frame_count / duration if duration > 0 else 0
+        }
 
 class OptimizedFaceTracker:
     def __init__(self):
@@ -389,7 +487,7 @@ class OptimizedFaceTracker:
         return faces
     
     def update_face_detection(self, frame):
-        """更新人臉檢測（無追蹤器版本）"""
+        """更新人臉檢測"""
         current_time = time.time()
         
         # 檢查是否需要進行新的檢測
@@ -477,14 +575,17 @@ def main():
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     
     tracker = OptimizedFaceTracker()
+    recorder = VideoRecorder()
+    
     mosaic_size = 15
     mosaic_style = 'pixelate'
     
-    print("\n=== 高性能人臉馬賽克 (優化版) ===")
+    print("\n=== 高性能人臣馬賽克 (優化版 + 錄影功能) ===")
     print("✓ YOLOv11n-face 深度學習檢測")
     print("✓ 位置平滑算法")
     print("✓ 小孩保護功能")
     print("✓ 高速處理優化")
+    print("✓ 影片錄製匯出")
     print("\n檢測方法:")
     if tracker.yolo_available:
         print("  ► YOLO (主要)")
@@ -501,6 +602,8 @@ def main():
     print("  c - 切換小孩保護模式")
     print("  a - 調整年齡閾值")
     print("  SPACE - 暫停/繼續")
+    print("  r - 開始/停止錄影")
+    print("  o - 開啟輸出資料夾")
     
     # 性能監控
     fps_counter = 0
@@ -530,6 +633,10 @@ def main():
             # 應用馬賽克
             display_frame = apply_smart_mosaic(display_frame, faces, mosaic_size, mosaic_style, tracker)
             
+            # 寫入錄影幀
+            if recorder.recording:
+                recorder.write_frame(display_frame)
+            
             # 性能統計
             frame_end = time.time()
             frame_time = frame_end - frame_start
@@ -554,6 +661,18 @@ def main():
             f'Effect: {mosaic_style} ({mosaic_size})',
             f'Child Protection: {"Enabled" if tracker.child_protection_enabled else "Disabled"}',
         ]
+        
+        # 錄影狀態資訊
+        if recorder.recording:
+            rec_info = recorder.get_recording_info()
+            if rec_info:
+                info_texts.extend([
+                    f'🎬 Recording: {rec_info["filename"]}',
+                    f'Duration: {rec_info["duration"]:.1f}s | Frames: {rec_info["frame_count"]}'
+                ])
+        else:
+            info_texts.append('📹 Press R to start recording')
+        
         if tracker.child_protection_enabled and DEEPFACE_AVAILABLE:
             info_texts.append(f'Age Threshold: {tracker.age_threshold} years')
             # 顯示檢測到的年齡資訊
@@ -571,21 +690,34 @@ def main():
         
         y_offset = 20
         for text in info_texts:
-            color = (0, 100, 255) if paused else (0, 255, 0)
+            # 錄影時使用紅色，暫停時使用黃色，正常時使用綠色
+            if recorder.recording and not paused:
+                color = (0, 0, 255)  # 紅色 - 錄影中
+            elif paused:
+                color = (0, 255, 255)  # 黃色 - 暫停
+            else:
+                color = (0, 255, 0)  # 綠色 - 正常
+            
             cv2.putText(display_frame, text, (10, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
             y_offset += 18
         
-        # 顯示追蹤狀態
-        # for i, face in enumerate(faces):
-        #     x, y, w, h = face
-        #     cv2.rectangle(display_frame, (x, y), (x+w, y+h), (0, 255, 0), 1)
+        # 錄影指示器
+        if recorder.recording:
+            # 閃爍的錄影圓點
+            if int(time.time() * 2) % 2:  # 每0.5秒閃爍
+                cv2.circle(display_frame, (display_frame.shape[1] - 30, 30), 10, (0, 0, 255), -1)
+                cv2.putText(display_frame, "REC", (display_frame.shape[1] - 60, 50), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         
-        cv2.imshow('高性能人臉馬賽克 - YOLOv11n', display_frame)
+        cv2.imshow('高性能人臉馬賽克 - YOLOv11n (含錄影)', display_frame)
         
         # 按鍵處理
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
+            # 退出前停止錄影
+            if recorder.recording:
+                recorder.stop_recording()
             break
         elif key == ord('+') or key == ord('='):
             mosaic_size = max(3, mosaic_size - 2)
@@ -624,6 +756,32 @@ def main():
         elif key == ord(' '):
             paused = not paused
             print("暫停" if paused else "繼續")
+        elif key == ord('r'):
+            # 錄影控制
+            if recorder.recording:
+                output_file = recorder.stop_recording()
+                if output_file:
+                    print(f"影片已儲存至: {output_file}")
+            else:
+                frame_size = (display_frame.shape[1], display_frame.shape[0])
+                if recorder.start_recording(frame_size):
+                    print("開始錄影...")
+                else:
+                    print("錄影啟動失敗")
+        elif key == ord('o'):
+            # 開啟輸出資料夾
+            output_dir = recorder.output_dir
+            if os.path.exists(output_dir):
+                try:
+                    # Windows
+                    if os.name == 'nt':
+                        os.startfile(output_dir)
+                    print(f"已開啟輸出資料夾: {output_dir}")
+                except Exception as e:
+                    print(f"無法開啟資料夾: {e}")
+                    print(f"手動路徑: {os.path.abspath(output_dir)}")
+            else:
+                print(f"輸出資料夾不存在: {output_dir}")
         elif key == ord('c'):
             # 切換小孩保護模式
             if DEEPFACE_AVAILABLE:
@@ -671,6 +829,10 @@ def main():
     
     cap.release()
     cv2.destroyAllWindows()
+    
+    # 清理資源
+    if recorder.recording:
+        recorder.stop_recording()
 
 if __name__ == "__main__":
     main()
