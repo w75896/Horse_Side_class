@@ -1,507 +1,782 @@
 import sys
 import cv2
 import numpy as np
-import threading
+from PyQt5.QtWidgets import *
+from PyQt5.QtCore import *
+from PyQt5.QtGui import *
 import time
-from PyQt5.QtWidgets import (
-    QApplication, QWidget, QLabel, QPushButton, QVBoxLayout,
-    QHBoxLayout, QSlider, QComboBox, QMessageBox, QGroupBox,
-    QCheckBox, QSpinBox, QStatusBar, QMainWindow, QFrame
-)
-from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap, QFont, QPalette, QColor
+import os
+from datetime import datetime
 
-# 引入你提供的 OptimizedFaceTracker 與 apply_smart_mosaic
-from face_tracker_module import OptimizedFaceTracker, apply_smart_mosaic
+# 導入主程式模組
+try:
+    from face_tracker_module import (
+        OptimizedFaceTracker, 
+        VideoRecorder, 
+        apply_smart_mosaic,
+        DEEPFACE_AVAILABLE,
+        MEDIAPIPE_AVAILABLE
+    )
+except ImportError:
+    print("錯誤：無法導入 paste.py 模組")
+    print("請確保 paste.py 在同一目錄下")
+    sys.exit(1)
 
 class VideoThread(QThread):
-    """獨立的視頻處理線程，避免界面卡頓"""
-    frame_ready = pyqtSignal(np.ndarray)
-    stats_ready = pyqtSignal(dict)
+    """影像處理執行緒"""
+    changePixmap = pyqtSignal(QImage)
+    updateFPS = pyqtSignal(float)
+    updateFaceCount = pyqtSignal(int)
+    updateRecordingInfo = pyqtSignal(dict)
+    errorOccurred = pyqtSignal(str)
     
     def __init__(self):
         super().__init__()
-        self.running = False
         self.cap = None
+        self.camera_index = 0  # 預設使用第一個相機
         self.tracker = OptimizedFaceTracker()
+        self.recorder = VideoRecorder()
+        self.running = True
+        self.paused = False
+        
+        # 參數
         self.mosaic_size = 15
         self.mosaic_style = 'pixelate'
-        self.paused = False
-        self.show_debug = False
+        self.faces = []
         
-        # 性能監控
+        # FPS 計算
         self.fps_counter = 0
         self.fps_timer = time.time()
         self.current_fps = 0
         
-    def set_camera(self, camera_index):
-        """設置攝像頭"""
-        if self.cap:
-            self.cap.release()
+    def run(self):
+        """執行緒主迴圈"""
+        # 嘗試開啟相機
+        if isinstance(self.camera_index, str):
+            # 如果是檔案路徑
+            self.cap = cv2.VideoCapture(self.camera_index)
+        else:
+            # 如果是相機索引
+            self.cap = cv2.VideoCapture(self.camera_index)
         
-        self.cap = cv2.VideoCapture(camera_index)
-        if self.cap.isOpened():
-            # 優化攝像頭設置
+        if not self.cap.isOpened():
+            self.errorOccurred.emit(f"無法開啟相機或影片: {self.camera_index}")
+            return
+        
+        # 優化攝影機設定（只對實體相機設定）
+        if isinstance(self.camera_index, int):
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
             self.cap.set(cv2.CAP_PROP_FPS, 30)
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            return True
-        return False
-    
-    def update_settings(self, mosaic_size, mosaic_style):
-        """更新馬賽克設置"""
-        self.mosaic_size = mosaic_size
-        self.mosaic_style = mosaic_style
-    
-    def toggle_pause(self):
-        """切換暫停狀態"""
-        self.paused = not self.paused
-    
-    def toggle_debug(self, show_debug):
-        """切換調試顯示"""
-        self.show_debug = show_debug
-    
-    def run(self):
-        """主線程循環"""
-        self.running = True
         
         while self.running:
-            if not self.cap or not self.cap.isOpened():
-                time.sleep(0.1)
-                continue
-            
-            if self.paused:
-                time.sleep(0.1)
-                continue
-            
-            frame_start = time.time()
-            
-            ret, frame = self.cap.read()
-            if not ret:
-                continue
-            
-            # 水平翻轉（鏡像效果）
-            # frame = cv2.flip(frame, 1)
-            
-            # 人臉檢測和追蹤
-            faces = self.tracker.update_face_tracking(frame)
-            
-            # 應用馬賽克
-            processed_frame = apply_smart_mosaic(frame.copy(), faces, 
-                                               self.mosaic_size, self.mosaic_style)
-            
-            # 添加調試信息
-            if self.show_debug:
-                self.add_debug_info(processed_frame, faces)
-            
-            # 計算 FPS
-            frame_time = time.time() - frame_start
-            self.fps_counter += 1
-            if self.fps_counter >= 15:
-                self.current_fps = 15 / (time.time() - self.fps_timer)
-                self.fps_timer = time.time()
-                self.fps_counter = 0
-                
-                # 發送統計信息
-                stats = {
-                    'fps': self.current_fps,
-                    'faces': len(faces),
-                    'trackers': len(self.tracker.trackers),
-                    'processing_time': frame_time * 1000,
-                    'detection_method': self.tracker.detection_method
-                }
-                self.stats_ready.emit(stats)
-            
-            # 發送處理後的幀
-            self.frame_ready.emit(processed_frame)
-    
-    def add_debug_info(self, frame, faces):
-        """添加調試信息到幀上"""
-        # 繪製人臉框
-        for i, face in enumerate(faces):
-            x, y, w, h = face
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.putText(frame, f'Face {i+1}', (x, y-10),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        
-        # 顯示基本信息
-        info_y = 25
-        cv2.putText(frame, f'Method: {self.tracker.detection_method}',
-                   (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
-        info_y += 25
-        cv2.putText(frame, f'Faces: {len(faces)} | Trackers: {len(self.tracker.trackers)}',
-                   (10, info_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1)
+            if not self.paused:
+                ret, frame = self.cap.read()
+                if ret:
+                    # 水平翻轉（只對實體相機）
+                    if isinstance(self.camera_index, int):
+                        frame = cv2.flip(frame, 1)
+                    
+                    # 人臉檢測
+                    self.faces = self.tracker.update_face_detection(frame)
+                    
+                    # 更新人臉數量
+                    self.updateFaceCount.emit(len(self.faces))
+                    
+                    # 應用馬賽克
+                    display_frame = apply_smart_mosaic(
+                        frame.copy(), 
+                        self.faces, 
+                        self.mosaic_size, 
+                        self.mosaic_style,
+                        self.tracker
+                    )
+                    
+                    # 錄影
+                    if self.recorder.recording:
+                        self.recorder.update_fps(self.current_fps)
+                        self.recorder.write_frame(display_frame)
+                        
+                        # 更新錄影資訊
+                        rec_info = self.recorder.get_recording_info()
+                        if rec_info:
+                            self.updateRecordingInfo.emit(rec_info)
+                    
+                    # 計算 FPS
+                    self.fps_counter += 1
+                    if self.fps_counter >= 15:
+                        self.current_fps = 15 / (time.time() - self.fps_timer)
+                        self.fps_timer = time.time()
+                        self.fps_counter = 0
+                        self.updateFPS.emit(self.current_fps)
+                    
+                    # 轉換為 Qt 格式
+                    rgb_image = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                    h, w, ch = rgb_image.shape
+                    bytes_per_line = ch * w
+                    qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                    
+                    self.changePixmap.emit(qt_image)
+                else:
+                    # 影片播放結束
+                    if isinstance(self.camera_index, str):
+                        break
+            else:
+                self.msleep(50)
     
     def stop(self):
-        """停止線程"""
+        """停止執行緒"""
         self.running = False
+        if self.recorder.recording:
+            self.recorder.stop_recording()
         if self.cap:
             self.cap.release()
         self.wait()
 
-class VideoMosaicApp(QMainWindow):
+class FaceMosaicGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.init_ui()
-        self.init_video_thread()
+        self.initUI()
+        self.video_thread = None
+        self.available_cameras = []  # 儲存可用相機列表
         
-    def init_ui(self):
-        """初始化用戶界面"""
-        self.setWindowTitle("高性能即時人臉馬賽克 - YOLOv11n 增強版")
-        self.setGeometry(100, 100, 900, 700)
+    def refresh_cameras(self):
+        """重新整理可用相機列表"""
+        self.camera_combo.clear()
+        self.available_cameras = []
         
-        # 設置樣式
-        self.setStyleSheet("""
-            QMainWindow {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-            QLabel {
-                color: #ffffff;
-                font-size: 12px;
-            }
-            QPushButton {
-                background-color: #404040;
-                color: #ffffff;
-                border: 1px solid #606060;
-                border-radius: 5px;
-                padding: 8px 16px;
-                font-size: 12px;
-            }
-            QPushButton:hover {
-                background-color: #505050;
-            }
-            QPushButton:pressed {
-                background-color: #353535;
-            }
-            QSlider::groove:horizontal {
-                border: 1px solid #606060;
-                height: 8px;
-                background: #404040;
-                border-radius: 4px;
-            }
-            QSlider::handle:horizontal {
-                background: #0078d4;
-                border: 1px solid #0078d4;
-                width: 18px;
-                margin: -5px 0;
-                border-radius: 9px;
-            }
-            QComboBox {
-                background-color: #404040;
-                color: #ffffff;
-                border: 1px solid #606060;
-                border-radius: 3px;
-                padding: 5px;
-            }
-            QGroupBox {
-                color: #ffffff;
-                border: 2px solid #606060;
-                border-radius: 5px;
-                margin-top: 10px;
-                font-weight: bold;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px 0 5px;
-            }
-        """)
+        # 測試可用的相機
+        for i in range(10):  # 測試前10個索引
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                # 取得相機資訊
+                backend = cap.getBackendName()
+                self.available_cameras.append(i)
+                self.camera_combo.addItem(f"相機 {i} ({backend})")
+                cap.release()
         
-        # 創建中央部件
+        # 如果沒有找到相機
+        if not self.available_cameras:
+            self.camera_combo.addItem("未偵測到相機")
+        
+        # 添加分隔線
+        if self.available_cameras:
+            self.camera_combo.insertSeparator(self.camera_combo.count())
+        
+        # 添加檔案選項
+        self.camera_combo.addItem("選擇影片檔案...")
+    
+    def select_video_file(self):
+        """選擇影片檔案"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "選擇影片檔案",
+            "",
+            "影片檔案 (*.mp4 *.avi *.mov *.mkv *.flv);;所有檔案 (*.*)"
+        )
+        
+        if file_path:
+            # 添加到下拉選單
+            display_name = f"檔案: {os.path.basename(file_path)}"
+            
+            # 檢查是否已存在
+            for i in range(self.camera_combo.count()):
+                if self.camera_combo.itemText(i) == display_name:
+                    self.camera_combo.setCurrentIndex(i)
+                    return
+            
+            # 添加新項目
+            self.camera_combo.addItem(display_name)
+            self.camera_combo.setItemData(self.camera_combo.count() - 1, file_path)
+            self.camera_combo.setCurrentIndex(self.camera_combo.count() - 1)
+    
+    def get_selected_camera(self):
+        """取得選擇的相機或檔案"""
+        current_index = self.camera_combo.currentIndex()
+        current_text = self.camera_combo.currentText()
+        
+        if current_text == "未偵測到相機":
+            return None
+        elif current_text == "選擇影片檔案...":
+            self.select_video_file()
+            return None
+        elif current_text.startswith("檔案:"):
+            # 返回檔案路徑
+            return self.camera_combo.itemData(current_index)
+        else:
+            # 返回相機索引
+            if current_index < len(self.available_cameras):
+                return self.available_cameras[current_index]
+        
+        return None
+        
+    def initUI(self):
+        """初始化使用者介面"""
+        self.setWindowTitle('智能人臉馬賽克系統')
+        self.setGeometry(100, 100, 1200, 800)
+        self.setMinimumSize(1000, 700)
+        
+        # 設定圖標
+        self.setWindowIcon(QIcon())
+        
+        # 中央元件
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         
         # 主佈局
         main_layout = QHBoxLayout(central_widget)
         
-        # 左側視頻顯示區域
-        video_layout = QVBoxLayout()
+        # 左側：影像顯示區
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
         
-        # 視頻顯示標籤
-        self.video_label = QLabel("按下『開始』以啟動攝像頭")
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(640, 480)
-        self.video_label.setStyleSheet("""
+        # 影像標籤
+        self.image_label = QLabel()
+        self.image_label.setMinimumSize(640, 480)
+        self.image_label.setStyleSheet("""
             QLabel {
-                border: 2px solid #606060;
-                background-color: #1a1a1a;
-                font-size: 16px;
+                border: 2px solid #ccc;
+                border-radius: 10px;
+                background-color: #000;
+            }
+        """)
+        self.image_label.setScaledContents(True)
+        self.image_label.setAlignment(Qt.AlignCenter)
+        
+        # 在未啟動時顯示提示
+        self.image_label.setText("點擊「啟動相機」開始")
+        self.image_label.setStyleSheet("""
+            QLabel {
+                border: 2px solid #ccc;
+                border-radius: 10px;
+                background-color: #000;
+                color: #fff;
+                font-size: 20px;
             }
         """)
         
-        # 控制按鈕
-        button_layout = QHBoxLayout()
+        left_layout.addWidget(self.image_label)
         
-        self.btn_start = QPushButton("🎥 開始")
-        self.btn_start.clicked.connect(self.toggle_camera)
+        # 狀態列
+        status_widget = QWidget()
+        status_layout = QHBoxLayout(status_widget)
         
-        self.btn_pause = QPushButton("⏸️ 暫停")
-        self.btn_pause.clicked.connect(self.toggle_pause)
-        self.btn_pause.setEnabled(False)
+        self.fps_label = QLabel('FPS: 0.0')
+        self.face_count_label = QLabel('檢測到的臉部: 0')
+        self.recording_label = QLabel('未錄影')
+        self.recording_label.setStyleSheet("color: green;")
         
-        self.btn_screenshot = QPushButton("📷 截圖")
-        self.btn_screenshot.clicked.connect(self.take_screenshot)
-        self.btn_screenshot.setEnabled(False)
+        status_layout.addWidget(self.fps_label)
+        status_layout.addWidget(self.face_count_label)
+        status_layout.addWidget(self.recording_label)
+        status_layout.addStretch()
         
-        button_layout.addWidget(self.btn_start)
-        button_layout.addWidget(self.btn_pause)
-        button_layout.addWidget(self.btn_screenshot)
-        button_layout.addStretch()
+        left_layout.addWidget(status_widget)
         
-        video_layout.addWidget(self.video_label)
-        video_layout.addLayout(button_layout)
+        # 右側：控制面板
+        right_panel = QWidget()
+        right_panel.setMaximumWidth(400)
+        right_layout = QVBoxLayout(right_panel)
         
-        # 右側控制面板
-        control_panel = self.create_control_panel()
+        # 標題
+        title_label = QLabel('控制面板')
+        title_label.setAlignment(Qt.AlignCenter)
+        title_label.setStyleSheet("""
+            QLabel {
+                font-size: 18px;
+                font-weight: bold;
+                padding: 10px;
+                background-color: #f0f0f0;
+                border-radius: 5px;
+            }
+        """)
+        right_layout.addWidget(title_label)
+        
+        # 滾動區域
+        scroll_area = QScrollArea()
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        
+        # 1. 相機控制
+        camera_group = self.create_camera_controls()
+        scroll_layout.addWidget(camera_group)
+        
+        # 2. 馬賽克設定
+        mosaic_group = self.create_mosaic_controls()
+        scroll_layout.addWidget(mosaic_group)
+        
+        # 3. 檢測設定
+        detection_group = self.create_detection_controls()
+        scroll_layout.addWidget(detection_group)
+        
+        # 4. 小孩保護
+        if DEEPFACE_AVAILABLE:
+            child_group = self.create_child_protection_controls()
+            scroll_layout.addWidget(child_group)
+        
+        # 5. 錄影控制
+        recording_group = self.create_recording_controls()
+        scroll_layout.addWidget(recording_group)
+        
+        scroll_layout.addStretch()
+        scroll_widget.setLayout(scroll_layout)
+        scroll_area.setWidget(scroll_widget)
+        scroll_area.setWidgetResizable(True)
+        
+        right_layout.addWidget(scroll_area)
         
         # 添加到主佈局
-        main_layout.addLayout(video_layout, 2)
-        main_layout.addWidget(control_panel, 1)
+        main_layout.addWidget(left_panel, 3)
+        main_layout.addWidget(right_panel, 1)
         
-        # 狀態欄
-        self.status_bar = self.statusBar()
-        self.status_bar.showMessage("就緒")
+        # 設定樣式表
+        self.setStyleSheet("""
+            QMainWindow {
+                background-color: #f5f5f5;
+            }
+            QGroupBox {
+                font-weight: bold;
+                border: 2px solid #cccccc;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+            }
+            QPushButton {
+                padding: 8px;
+                border-radius: 5px;
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #45a049;
+            }
+            QPushButton:pressed {
+                background-color: #3d8b40;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #666666;
+            }
+            QSlider::groove:horizontal {
+                height: 8px;
+                background: #d3d3d3;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #4CAF50;
+                border: 1px solid #5c5c5c;
+                width: 18px;
+                margin: -5px 0;
+                border-radius: 9px;
+            }
+        """)
         
-        # 存儲變量
-        self.running = False
-        self.current_frame = None
+    def create_camera_controls(self):
+        """建立相機控制元件"""
+        group = QGroupBox("相機控制")
+        layout = QVBoxLayout()
         
-    def create_control_panel(self):
-        """創建控制面板"""
-        panel = QFrame()
-        panel.setMaximumWidth(300)
-        panel.setStyleSheet("QFrame { border: 1px solid #606060; }")
+        # 相機選擇
+        camera_label = QLabel("選擇相機/影片:")
+        layout.addWidget(camera_label)
         
-        layout = QVBoxLayout(panel)
+        camera_select_layout = QHBoxLayout()
+        self.camera_combo = QComboBox()
+        self.refresh_cameras()
+        camera_select_layout.addWidget(self.camera_combo)
         
-        # 馬賽克設置組
-        mosaic_group = QGroupBox("馬賽克設置")
-        mosaic_layout = QVBoxLayout(mosaic_group)
+        # 重新整理按鈕
+        refresh_button = QPushButton("🔄")
+        refresh_button.setMaximumWidth(30)
+        refresh_button.setToolTip("重新整理相機列表")
+        refresh_button.clicked.connect(self.refresh_cameras)
+        camera_select_layout.addWidget(refresh_button)
         
-        # 強度滑塊
+        # 選擇檔案按鈕
+        file_button = QPushButton("📁")
+        file_button.setMaximumWidth(30)
+        file_button.setToolTip("選擇影片檔案")
+        file_button.clicked.connect(self.select_video_file)
+        camera_select_layout.addWidget(file_button)
+        
+        layout.addLayout(camera_select_layout)
+        
+        # 啟動/停止按鈕
+        self.start_button = QPushButton('啟動相機')
+        self.start_button.clicked.connect(self.toggle_camera)
+        layout.addWidget(self.start_button)
+        
+        # 暫停按鈕
+        self.pause_button = QPushButton('暫停')
+        self.pause_button.clicked.connect(self.toggle_pause)
+        self.pause_button.setEnabled(False)
+        layout.addWidget(self.pause_button)
+        
+        group.setLayout(layout)
+        return group
+    
+    def create_mosaic_controls(self):
+        """建立馬賽克控制元件"""
+        group = QGroupBox("馬賽克設定")
+        layout = QVBoxLayout()
+        
+        # 效果選擇
+        effect_label = QLabel("效果類型:")
+        layout.addWidget(effect_label)
+        
+        self.effect_combo = QComboBox()
+        self.effect_combo.addItems(['像素化', '模糊', '黑色遮擋'])
+        self.effect_combo.currentTextChanged.connect(self.change_mosaic_style)
+        layout.addWidget(self.effect_combo)
+        
+        # 強度調整
+        intensity_label = QLabel("馬賽克強度:")
+        layout.addWidget(intensity_label)
+        
         intensity_layout = QHBoxLayout()
-        intensity_layout.addWidget(QLabel("強度:"))
         self.intensity_slider = QSlider(Qt.Horizontal)
-        self.intensity_slider.setRange(3, 50)
+        self.intensity_slider.setMinimum(3)
+        self.intensity_slider.setMaximum(50)
         self.intensity_slider.setValue(15)
-        self.intensity_slider.valueChanged.connect(self.update_mosaic_settings)
-        self.intensity_label = QLabel("15")
+        self.intensity_slider.valueChanged.connect(self.change_mosaic_size)
+        
+        self.intensity_value = QLabel('15')
+        
         intensity_layout.addWidget(self.intensity_slider)
-        intensity_layout.addWidget(self.intensity_label)
+        intensity_layout.addWidget(self.intensity_value)
+        layout.addLayout(intensity_layout)
         
-        # 樣式選擇
-        style_layout = QHBoxLayout()
-        style_layout.addWidget(QLabel("樣式:"))
-        self.style_combo = QComboBox()
-        self.style_combo.addItems(['pixelate', 'blur', 'black'])
-        self.style_combo.currentTextChanged.connect(self.update_mosaic_settings)
-        style_layout.addWidget(self.style_combo)
+        # 安全邊界
+        margin_label = QLabel("安全邊界:")
+        layout.addWidget(margin_label)
         
-        mosaic_layout.addLayout(intensity_layout)
-        mosaic_layout.addLayout(style_layout)
+        margin_layout = QHBoxLayout()
+        self.margin_slider = QSlider(Qt.Horizontal)
+        self.margin_slider.setMinimum(100)
+        self.margin_slider.setMaximum(200)
+        self.margin_slider.setValue(130)
+        self.margin_slider.valueChanged.connect(self.change_safety_margin)
         
-        # 攝像頭設置組
-        camera_group = QGroupBox("攝像頭設置")
-        camera_layout = QVBoxLayout(camera_group)
+        self.margin_value = QLabel('1.3x')
         
-        # 攝像頭選擇
-        camera_layout.addWidget(QLabel("攝像頭索引:"))
-        self.camera_spin = QSpinBox()
-        self.camera_spin.setRange(0, 5)
-        self.camera_spin.setValue(0)
-        camera_layout.addWidget(self.camera_spin)
+        margin_layout.addWidget(self.margin_slider)
+        margin_layout.addWidget(self.margin_value)
+        layout.addLayout(margin_layout)
         
-        # 調試選項
-        debug_group = QGroupBox("調試選項")
-        debug_layout = QVBoxLayout(debug_group)
+        group.setLayout(layout)
+        return group
+    
+    def create_detection_controls(self):
+        """建立檢測控制元件"""
+        group = QGroupBox("檢測設定")
+        layout = QVBoxLayout()
         
-        self.debug_check = QCheckBox("顯示人臉框")
-        self.debug_check.toggled.connect(self.toggle_debug)
-        debug_layout.addWidget(self.debug_check)
+        # 檢測方法
+        method_label = QLabel("檢測方法:")
+        layout.addWidget(method_label)
         
-        # 檢測方法切換
-        method_layout = QHBoxLayout()
-        method_layout.addWidget(QLabel("檢測方法:"))
         self.method_combo = QComboBox()
-        method_layout.addWidget(self.method_combo)
-        debug_layout.addLayout(method_layout)
         
-        # 統計信息組
-        stats_group = QGroupBox("實時統計")
-        stats_layout = QVBoxLayout(stats_group)
-        
-        self.fps_label = QLabel("FPS: --")
-        self.faces_label = QLabel("檢測到的人臉: --")
-        self.trackers_label = QLabel("活躍追蹤器: --")
-        self.processing_label = QLabel("處理時間: --")
-        self.method_label = QLabel("檢測方法: --")
-        
-        stats_layout.addWidget(self.fps_label)
-        stats_layout.addWidget(self.faces_label)
-        stats_layout.addWidget(self.trackers_label)
-        stats_layout.addWidget(self.processing_label)
-        stats_layout.addWidget(self.method_label)
-        
-        # 添加所有組到面板
-        layout.addWidget(mosaic_group)
-        layout.addWidget(camera_group)
-        layout.addWidget(debug_group)
-        layout.addWidget(stats_group)
-        layout.addStretch()
-        
-        return panel
-    
-    def init_video_thread(self):
-        """初始化視頻處理線程"""
-        self.video_thread = VideoThread()
-        self.video_thread.frame_ready.connect(self.update_video_display)
-        self.video_thread.stats_ready.connect(self.update_stats)
-        
-        # 初始化檢測方法選項
-        self.update_method_combo()
-    
-    def update_method_combo(self):
-        """更新檢測方法下拉框"""
+        # 添加可用的檢測方法
         methods = []
-        if hasattr(self.video_thread.tracker, 'yolo_available') and self.video_thread.tracker.yolo_available:
+        if hasattr(self, 'video_thread') and self.video_thread and self.video_thread.tracker.yolo_available:
             methods.append('YOLO')
-        
-        # 檢查 MediaPipe 是否可用
-        try:
-            import mediapipe as mp
+        if MEDIAPIPE_AVAILABLE:
             methods.append('MediaPipe')
-        except ImportError:
-            pass
-        
         methods.append('Haar Cascade')
         
-        self.method_combo.clear()
         self.method_combo.addItems(methods)
         self.method_combo.currentTextChanged.connect(self.change_detection_method)
+        layout.addWidget(self.method_combo)
+        
+        # 檢測資訊
+        info_label = QLabel("可用檢測方法將在啟動相機後顯示")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(info_label)
+        
+        group.setLayout(layout)
+        return group
+    
+    def create_child_protection_controls(self):
+        """建立小孩保護控制元件"""
+        group = QGroupBox("小孩保護功能")
+        layout = QVBoxLayout()
+        
+        # 啟用開關
+        self.child_protection_check = QCheckBox("啟用小孩保護")
+        self.child_protection_check.stateChanged.connect(self.toggle_child_protection)
+        layout.addWidget(self.child_protection_check)
+        
+        # 年齡閾值
+        age_label = QLabel("年齡閾值:")
+        layout.addWidget(age_label)
+        
+        age_layout = QHBoxLayout()
+        self.age_spinbox = QSpinBox()
+        self.age_spinbox.setMinimum(1)
+        self.age_spinbox.setMaximum(100)
+        self.age_spinbox.setValue(18)
+        self.age_spinbox.valueChanged.connect(self.change_age_threshold)
+        
+        age_layout.addWidget(self.age_spinbox)
+        age_layout.addWidget(QLabel("歲"))
+        age_layout.addStretch()
+        layout.addLayout(age_layout)
+        
+        # 說明
+        info_label = QLabel("啟用後只會對設定年齡以下的臉部應用馬賽克")
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #666; font-size: 11px;")
+        layout.addWidget(info_label)
+        
+        group.setLayout(layout)
+        return group
+    
+    def create_recording_controls(self):
+        """建立錄影控制元件"""
+        group = QGroupBox("錄影功能")
+        layout = QVBoxLayout()
+        
+        # 錄影按鈕
+        self.record_button = QPushButton('開始錄影')
+        self.record_button.clicked.connect(self.toggle_recording)
+        self.record_button.setEnabled(False)
+        self.record_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+            }
+            QPushButton:hover {
+                background-color: #da190b;
+            }
+        """)
+        layout.addWidget(self.record_button)
+        
+        # 錄影資訊
+        self.recording_info_label = QLabel("錄影資訊將在此顯示")
+        self.recording_info_label.setWordWrap(True)
+        self.recording_info_label.setStyleSheet("font-size: 11px;")
+        layout.addWidget(self.recording_info_label)
+        
+        # 開啟資料夾按鈕
+        self.open_folder_button = QPushButton('開啟輸出資料夾')
+        self.open_folder_button.clicked.connect(self.open_output_folder)
+        layout.addWidget(self.open_folder_button)
+        
+        group.setLayout(layout)
+        return group
     
     def toggle_camera(self):
-        """切換攝像頭狀態"""
-        if not self.running:
-            camera_index = self.camera_spin.value()
-            if self.video_thread.set_camera(camera_index):
-                self.video_thread.start()
-                self.running = True
-                self.btn_start.setText("🛑 停止")
-                self.btn_pause.setEnabled(True)
-                self.btn_screenshot.setEnabled(True)
-                self.status_bar.showMessage("攝像頭已啟動")
-            else:
-                QMessageBox.warning(self, "錯誤", f"無法開啟攝像頭 {camera_index}")
+        """啟動/停止相機"""
+        if self.video_thread is None:
+            # 取得選擇的相機
+            camera_source = self.get_selected_camera()
+            if camera_source is None:
+                return
+            
+            # 啟動相機
+            self.video_thread = VideoThread()
+            self.video_thread.camera_index = camera_source  # 設定相機來源
+            self.video_thread.changePixmap.connect(self.update_image)
+            self.video_thread.updateFPS.connect(self.update_fps)
+            self.video_thread.updateFaceCount.connect(self.update_face_count)
+            self.video_thread.updateRecordingInfo.connect(self.update_recording_info)
+            self.video_thread.errorOccurred.connect(self.handle_video_error)
+            self.video_thread.start()
+            
+            self.start_button.setText('停止相機')
+            self.pause_button.setEnabled(True)
+            self.record_button.setEnabled(True)
+            self.camera_combo.setEnabled(False)  # 執行時禁用相機選擇
+            
+            # 更新檢測方法選項
+            self.update_detection_methods()
+            
         else:
+            # 停止相機
             self.video_thread.stop()
-            self.running = False
-            self.btn_start.setText("🎥 開始")
-            self.btn_pause.setEnabled(False)
-            self.btn_screenshot.setEnabled(False)
-            self.video_label.setText("按下『開始』以啟動攝像頭")
-            self.status_bar.showMessage("攝像頭已停止")
+            self.video_thread = None
+            
+            self.start_button.setText('啟動相機')
+            self.pause_button.setEnabled(False)
+            self.pause_button.setText('暫停')
+            self.record_button.setEnabled(False)
+            self.record_button.setText('開始錄影')
+            self.camera_combo.setEnabled(True)  # 重新啟用相機選擇
+            
+            # 清空顯示
+            self.image_label.clear()
+            self.image_label.setText("點擊「啟動相機」開始")
+            self.fps_label.setText('FPS: 0.0')
+            self.face_count_label.setText('檢測到的臉部: 0')
+            self.recording_label.setText('未錄影')
+            self.recording_label.setStyleSheet("color: green;")
+    
+    def handle_video_error(self, error_msg):
+        """處理影片錯誤"""
+        QMessageBox.critical(self, "錯誤", error_msg)
+        if self.video_thread:
+            self.toggle_camera()  # 停止相機
     
     def toggle_pause(self):
-        """切換暫停狀態"""
-        if self.running:
-            self.video_thread.toggle_pause()
-            if self.video_thread.paused:
-                self.btn_pause.setText("▶️ 繼續")
-                self.status_bar.showMessage("已暫停")
+        """暫停/繼續"""
+        if self.video_thread:
+            self.video_thread.paused = not self.video_thread.paused
+            self.pause_button.setText('繼續' if self.video_thread.paused else '暫停')
+    
+    def toggle_recording(self):
+        """開始/停止錄影"""
+        if self.video_thread:
+            if self.video_thread.recorder.recording:
+                # 停止錄影
+                output_file = self.video_thread.recorder.stop_recording()
+                self.record_button.setText('開始錄影')
+                self.recording_label.setText('未錄影')
+                self.recording_label.setStyleSheet("color: green;")
+                
+                if output_file:
+                    QMessageBox.information(self, '錄影完成', f'影片已儲存至:\n{output_file}')
             else:
-                self.btn_pause.setText("⏸️ 暫停")
-                self.status_bar.showMessage("攝像頭運行中")
+                # 開始錄影
+                if self.video_thread.recorder.start_recording():
+                    self.record_button.setText('停止錄影')
+                    self.recording_label.setText('錄影中...')
+                    self.recording_label.setStyleSheet("color: red;")
+                else:
+                    QMessageBox.warning(self, '錯誤', '無法開始錄影')
     
-    def take_screenshot(self):
-        """截圖功能"""
-        if self.current_frame is not None:
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            filename = f"screenshot_{timestamp}.png"
-            cv2.imwrite(filename, self.current_frame)
-            QMessageBox.information(self, "截圖成功", f"已保存為 {filename}")
+    def open_output_folder(self):
+        """開啟輸出資料夾"""
+        output_dir = "recorded_videos"
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        try:
+            if sys.platform == 'win32':
+                os.startfile(output_dir)
+            elif sys.platform == 'darwin':
+                os.system(f'open "{output_dir}"')
+            else:
+                os.system(f'xdg-open "{output_dir}"')
+        except Exception as e:
+            QMessageBox.warning(self, '錯誤', f'無法開啟資料夾:\n{str(e)}')
     
-    def update_mosaic_settings(self):
-        """更新馬賽克設置"""
-        intensity = self.intensity_slider.value()
-        style = self.style_combo.currentText()
-        
-        self.intensity_label.setText(str(intensity))
-        
-        if self.running:
-            self.video_thread.update_settings(intensity, style)
+    def update_detection_methods(self):
+        """更新可用的檢測方法"""
+        if self.video_thread:
+            self.method_combo.clear()
+            methods = []
+            
+            if self.video_thread.tracker.yolo_available:
+                methods.append('YOLO')
+            if MEDIAPIPE_AVAILABLE:
+                methods.append('MediaPipe')
+            methods.append('Haar Cascade')
+            
+            self.method_combo.addItems(methods)
     
-    def toggle_debug(self, enabled):
-        """切換調試顯示"""
-        if self.running:
-            self.video_thread.toggle_debug(enabled)
+    def change_mosaic_style(self, text):
+        """改變馬賽克樣式"""
+        if self.video_thread:
+            style_map = {
+                '像素化': 'pixelate',
+                '模糊': 'blur',
+                '黑色遮擋': 'black'
+            }
+            self.video_thread.mosaic_style = style_map.get(text, 'pixelate')
     
-    def change_detection_method(self, method_name):
-        """更改檢測方法"""
-        method_map = {
-            'YOLO': 'yolo',
-            'MediaPipe': 'mediapipe',
-            'Haar Cascade': 'haar'
-        }
-        
-        if method_name in method_map and self.running:
-            self.video_thread.tracker.detection_method = method_map[method_name]
+    def change_mosaic_size(self, value):
+        """改變馬賽克大小"""
+        self.intensity_value.setText(str(value))
+        if self.video_thread:
+            self.video_thread.mosaic_size = value
     
-    def update_video_display(self, frame):
-        """更新視頻顯示"""
-        self.current_frame = frame
-        
-        # 轉換為 Qt 格式
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_frame.shape
-        bytes_per_line = ch * w
-        
-        qt_image = QImage(rgb_frame.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        
-        # 縮放到合適大小
-        pixmap = QPixmap.fromImage(qt_image)
-        scaled_pixmap = pixmap.scaled(self.video_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        
-        self.video_label.setPixmap(scaled_pixmap)
+    def change_safety_margin(self, value):
+        """改變安全邊界"""
+        margin = value / 100.0
+        self.margin_value.setText(f'{margin:.1f}x')
+        if self.video_thread:
+            self.video_thread.tracker.safety_margin = margin
     
-    def update_stats(self, stats):
-        """更新統計信息"""
-        self.fps_label.setText(f"FPS: {stats['fps']:.1f}")
-        self.faces_label.setText(f"檢測到的人臉: {stats['faces']}")
-        self.trackers_label.setText(f"活躍追蹤器: {stats['trackers']}")
-        self.processing_label.setText(f"處理時間: {stats['processing_time']:.1f}ms")
-        self.method_label.setText(f"檢測方法: {stats['detection_method'].upper()}")
+    def change_detection_method(self, text):
+        """改變檢測方法"""
+        if self.video_thread:
+            method_map = {
+                'YOLO': 'yolo',
+                'MediaPipe': 'mediapipe',
+                'Haar Cascade': 'haar'
+            }
+            self.video_thread.tracker.detection_method = method_map.get(text, 'haar')
+    
+    def toggle_child_protection(self, state):
+        """切換小孩保護"""
+        if self.video_thread:
+            self.video_thread.tracker.child_protection_enabled = (state == Qt.Checked)
+            if state == Qt.Checked:
+                self.video_thread.tracker.face_age_cache.clear()
+                self.video_thread.tracker.last_age_detection.clear()
+    
+    def change_age_threshold(self, value):
+        """改變年齡閾值"""
+        if self.video_thread:
+            self.video_thread.tracker.age_threshold = value
+            self.video_thread.tracker.face_age_cache.clear()
+            self.video_thread.tracker.last_age_detection.clear()
+    
+    @pyqtSlot(QImage)
+    def update_image(self, image):
+        """更新顯示影像"""
+        pixmap = QPixmap.fromImage(image)
+        scaled_pixmap = pixmap.scaled(
+            self.image_label.size(), 
+            Qt.KeepAspectRatio, 
+            Qt.SmoothTransformation
+        )
+        self.image_label.setPixmap(scaled_pixmap)
+    
+    @pyqtSlot(float)
+    def update_fps(self, fps):
+        """更新 FPS 顯示"""
+        self.fps_label.setText(f'FPS: {fps:.1f}')
+    
+    @pyqtSlot(int)
+    def update_face_count(self, count):
+        """更新檢測到的臉部數量"""
+        self.face_count_label.setText(f'檢測到的臉部: {count}')
+    
+    @pyqtSlot(dict)
+    def update_recording_info(self, info):
+        """更新錄影資訊"""
+        text = f"檔案: {info['filename']}\n"
+        text += f"錄製時長: {info['duration']:.1f}秒\n"
+        text += f"影片時長: {info['estimated_video_duration']:.1f}秒\n"
+        text += f"幀數: {info['frame_count']}"
+        self.recording_info_label.setText(text)
     
     def closeEvent(self, event):
-        """關閉事件處理"""
-        if self.running:
+        """關閉視窗事件"""
+        if self.video_thread:
             self.video_thread.stop()
         event.accept()
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyle('Fusion')
     
-    # 設置應用程式圖標和基本信息
-    app.setApplicationName("人臉馬賽克")
-    app.setApplicationVersion("2.0")
-    app.setOrganizationName("AI Vision Tools")
+    # 設定應用程式圖標
+    app.setWindowIcon(QIcon())
     
-    # 創建並顯示主窗口
-    window = VideoMosaicApp()
-    window.show()
-    
-    # 顯示歡迎信息
-    QMessageBox.information(window, "歡迎使用", 
-                           "高性能即時人臉馬賽克應用程式\n\n"
-                           "功能特色:\n"
-                           "• YOLOv11n 深度學習檢測\n"
-                           "• 智能追蹤算法\n"
-                           "• 多種馬賽克效果\n"
-                           "• 實時性能監控\n\n"
-                           "請確保已安裝相關依賴套件")
+    gui = FaceMosaicGUI()
+    gui.show()
     
     sys.exit(app.exec_())
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

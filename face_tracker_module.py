@@ -5,23 +5,30 @@ import time
 from collections import deque
 import os
 from datetime import datetime
-
-# 嘗試導入 DeepFace
+# 導入 DeepFace
 try:
     from deepface import DeepFace
     DEEPFACE_AVAILABLE = True
-except ImportError:
+    print("✓ DeepFace 載入成功")
+except ImportError as e:
     DEEPFACE_AVAILABLE = False
-    print("  DeepFace 未安裝，小孩保護功能不可用")
-    print("   安裝方式: pip install deepface")
+    print("✗ DeepFace 載入失敗 (小孩保護功能將不可用)")
+    print(f"  錯誤: {str(e)}")
+except Exception as e:
+    DEEPFACE_AVAILABLE = False
+    print("✗ DeepFace 載入時發生錯誤")
+    print(f"  錯誤類型: {type(e).__name__}")
+    print(f"  錯誤訊息: {str(e)}")
 
-# 嘗試導入MediaPipe
+# 導入 MediaPipe
 try:
     import mediapipe as mp
     MEDIAPIPE_AVAILABLE = True
-except ImportError:
+    print("✓ MediaPipe 載入成功")
+except ImportError as e:
     MEDIAPIPE_AVAILABLE = False
-    print("建議安裝MediaPipe以獲得更好效果: pip install mediapipe")
+    print("✗ MediaPipe 載入失敗 (人臉檢測功能將不可用)")
+    print(f"  錯誤: {str(e)}")
 
 class VideoRecorder:
     """影片錄製管理器"""
@@ -34,7 +41,7 @@ class VideoRecorder:
         
         # 錄製設定 - 動態FPS
         self.target_fps = 30  # 目標FPS
-        self.actual_fps = 30  # 實際FPS（動態調整）
+        self.actual_fps = 30  # 實際FPS
         self.frame_size = (640, 480)
         self.codec = cv2.VideoWriter_fourcc(*'mp4v')
         
@@ -523,7 +530,7 @@ class OptimizedFaceTracker:
         return faces
     
     def update_face_detection(self, frame):
-        """更新人臉檢測（無追蹤器版本）"""
+        """更新人臉檢測"""
         current_time = time.time()
         
         # 檢查是否需要進行新的檢測
