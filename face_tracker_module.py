@@ -202,7 +202,7 @@ class OptimizedFaceTracker:
         self.child_protection_enabled = False
         self.age_threshold = 18  # 18歲以下視為小孩
         self.face_age_cache = {}  # 緩存年齡檢測結果
-        self.age_detection_interval = 2.0  # 每2秒重新檢測年齡
+        self.age_detection_interval = 1.0  # 每1秒重新檢測年齡
         self.last_age_detection = {}  # 記錄每張臉的最後檢測時間
         
         # DeepFace 設定
@@ -415,7 +415,7 @@ class OptimizedFaceTracker:
             face_img = frame[y_start:y_end, x_start:x_end]
             
             # 確保圖像大小足夠
-            if face_img.shape[0] < 48 or face_img.shape[1] < 48:
+            if face_img.shape[0] < 20 or face_img.shape[1] < 20:
                 return None
             
             # 使用 DeepFace 分析年齡
@@ -662,7 +662,7 @@ def main():
             if not ret:
                 break
             
-            frame = cv2.flip(frame, 1)
+            # frame = cv2.flip(frame, 1)
             display_frame = frame.copy()
             
             # 人臉檢測

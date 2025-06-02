@@ -18,8 +18,8 @@ try:
         MEDIAPIPE_AVAILABLE
     )
 except ImportError:
-    print("錯誤：無法導入 paste.py 模組")
-    print("請確保 paste.py 在同一目錄下")
+    print("錯誤：無法導入 face_tracker_module.py 模組")
+    print("請確保 face_tracker_module.py 在同一目錄下")
     sys.exit(1)
 
 class VideoThread(QThread):
@@ -28,6 +28,7 @@ class VideoThread(QThread):
     updateFPS = pyqtSignal(float)
     updateFaceCount = pyqtSignal(int)
     updateRecordingInfo = pyqtSignal(dict)
+    updateAgeInfo = pyqtSignal(list)
     errorOccurred = pyqtSignal(str)
     
     def __init__(self):
@@ -76,7 +77,8 @@ class VideoThread(QThread):
                 if ret:
                     # 水平翻轉（只對實體相機）
                     if isinstance(self.camera_index, int):
-                        frame = cv2.flip(frame, 1)
+                        # frame = cv2.flip(frame, 1)
+                        pass
                     
                     # 人臉檢測
                     self.faces = self.tracker.update_face_detection(frame)
@@ -92,6 +94,22 @@ class VideoThread(QThread):
                         self.mosaic_style,
                         self.tracker
                     )
+                    
+                    # 如果啟用小孩保護，發送年齡資訊
+                    if self.tracker.child_protection_enabled and DEEPFACE_AVAILABLE and self.faces:
+                        age_info = []
+                        for i, face in enumerate(self.faces[:5]):  # 最多顯示5個
+                            face_hash = self.tracker.get_face_hash(face)
+                            if face_hash in self.tracker.face_age_cache:
+                                age = self.tracker.face_age_cache[face_hash]
+                                if age is not None:
+                                    age_info.append({
+                                        'face_id': i + 1,
+                                        'age': int(age),
+                                        'protected': age < self.tracker.age_threshold
+                                    })
+                        if age_info:
+                            self.updateAgeInfo.emit(age_info)
                     
                     # 錄影
                     if self.recorder.recording:
@@ -213,7 +231,7 @@ class FaceMosaicGUI(QMainWindow):
         
     def initUI(self):
         """初始化使用者介面"""
-        self.setWindowTitle('智能人臉馬賽克系統')
+        self.setWindowTitle('即時人臉馬賽克系統')
         self.setGeometry(100, 100, 1200, 800)
         self.setMinimumSize(1000, 700)
         
@@ -260,17 +278,25 @@ class FaceMosaicGUI(QMainWindow):
         
         # 狀態列
         status_widget = QWidget()
-        status_layout = QHBoxLayout(status_widget)
+        status_layout = QGridLayout(status_widget)
+        status_layout.setSpacing(10)
         
+        # 第一行：基本資訊
         self.fps_label = QLabel('FPS: 0.0')
         self.face_count_label = QLabel('檢測到的臉部: 0')
         self.recording_label = QLabel('未錄影')
         self.recording_label.setStyleSheet("color: green;")
         
-        status_layout.addWidget(self.fps_label)
-        status_layout.addWidget(self.face_count_label)
-        status_layout.addWidget(self.recording_label)
-        status_layout.addStretch()
+        status_layout.addWidget(self.fps_label, 0, 0)
+        status_layout.addWidget(self.face_count_label, 0, 1)
+        status_layout.addWidget(self.recording_label, 0, 2)
+        
+        # 第二行：年齡資訊（預留空間）
+        self.age_info_label = QLabel('')
+        self.age_info_label.setStyleSheet("color: #666; font-size: 11px;")
+        status_layout.addWidget(self.age_info_label, 1, 0, 1, 3)  # 跨3列
+        
+        status_layout.setColumnStretch(3, 1)  # 讓最後一列伸展
         
         left_layout.addWidget(status_widget)
         
@@ -588,6 +614,7 @@ class FaceMosaicGUI(QMainWindow):
             self.video_thread.updateFPS.connect(self.update_fps)
             self.video_thread.updateFaceCount.connect(self.update_face_count)
             self.video_thread.updateRecordingInfo.connect(self.update_recording_info)
+            self.video_thread.updateAgeInfo.connect(self.update_age_info)
             self.video_thread.errorOccurred.connect(self.handle_video_error)
             self.video_thread.start()
             
@@ -618,6 +645,7 @@ class FaceMosaicGUI(QMainWindow):
             self.face_count_label.setText('檢測到的臉部: 0')
             self.recording_label.setText('未錄影')
             self.recording_label.setStyleSheet("color: green;")
+            self.age_info_label.setText('')
     
     def handle_video_error(self, error_msg):
         """處理影片錯誤"""
@@ -722,6 +750,9 @@ class FaceMosaicGUI(QMainWindow):
             if state == Qt.Checked:
                 self.video_thread.tracker.face_age_cache.clear()
                 self.video_thread.tracker.last_age_detection.clear()
+            else:
+                # 關閉時清空年齡資訊顯示
+                self.age_info_label.setText('')
     
     def change_age_threshold(self, value):
         """改變年齡閾值"""
@@ -759,6 +790,37 @@ class FaceMosaicGUI(QMainWindow):
         text += f"影片時長: {info['estimated_video_duration']:.1f}秒\n"
         text += f"幀數: {info['frame_count']}"
         self.recording_info_label.setText(text)
+    
+    @pyqtSlot(list)
+    def update_age_info(self, age_info):
+        """更新年齡檢測資訊"""
+        if not age_info:
+            self.age_info_label.setText('')
+            return
+        
+        # 建立顯示文字
+        age_texts = []
+        protected_count = 0
+        
+        for info in age_info:
+            face_id = info['face_id']
+            age = info['age']
+            protected = info['protected']
+            
+            if protected:
+                age_texts.append(f"臉部{face_id}: {age}歲 (保護)")
+                protected_count += 1
+            else:
+                age_texts.append(f"臉部{face_id}: {age}歲")
+        
+        # 組合顯示文字
+        display_text = "年齡檢測: " + " | ".join(age_texts)
+        
+        # 如果有被保護的臉部，加上統計
+        if protected_count > 0:
+            display_text += f" - 共 {protected_count} 個臉部被保護"
+        
+        self.age_info_label.setText(display_text)
     
     def closeEvent(self, event):
         """關閉視窗事件"""
